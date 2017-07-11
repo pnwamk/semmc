@@ -35,11 +35,11 @@ caller controls the number and placement of threads.
 
 -}
 
-strata :: (CRU.IsExprBuilder sym, CRU.IsSymInterface sym, Architecture arch, D.ArbitraryOperands (Opcode arch) (Operand arch))
+strata :: (CRU.IsExprBuilder sym, CRU.IsSymInterface sym, Architecture arch, D.ArbitraryOperands (Opcode arch) (Operand arch), Ord (Instruction arch))
        => Syn sym arch (MapF.MapF (Opcode arch (Operand arch)) (F.ParameterizedFormula sym arch))
 strata = processWorklist >> generalize
 
-processWorklist :: (Architecture arch, D.ArbitraryOperands (Opcode arch) (Operand arch))
+processWorklist :: (Architecture arch, D.ArbitraryOperands (Opcode arch) (Operand arch), Ord (Instruction arch))
                 => Syn sym arch ()
 processWorklist = do
   mwork <- takeWork
@@ -57,7 +57,7 @@ processWorklist = do
 -- | Attempt to learn a formula for the given opcode
 --
 -- Return 'Nothing' if we time out trying to find a formula
-strataOne :: (Architecture arch, D.ArbitraryOperands (Opcode arch) (Operand arch))
+strataOne :: (Architecture arch, D.ArbitraryOperands (Opcode arch) (Operand arch), Ord (Instruction arch))
           => Opcode arch (Operand arch) sh
           -> Syn sym arch (Maybe (F.ParameterizedFormula sym arch sh))
 strataOne op = do
@@ -67,7 +67,8 @@ strataOne op = do
     Nothing -> return Nothing
     Just prog -> strataOneLoop op instr (C.equivalenceClasses prog)
 
-strataOneLoop :: Opcode arch (Operand arch) sh
+strataOneLoop :: (Ord (Instruction arch))
+              => Opcode arch (Operand arch) sh
               -> Instruction arch
               -> C.EquivalenceClasses arch
               -> Syn sym arch (Maybe (F.ParameterizedFormula sym arch sh))
