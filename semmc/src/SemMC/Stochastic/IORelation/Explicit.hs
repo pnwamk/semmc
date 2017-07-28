@@ -26,7 +26,7 @@ import qualified Dismantle.Instruction as D
 import qualified Dismantle.Instruction.Random as D
 
 import SemMC.Architecture
-import SemMC.ConcreteState ( ConcreteState )
+import qualified SemMC.ConcreteState as CS
 
 import SemMC.Stochastic.IORelation.Shared
 import SemMC.Stochastic.IORelation.Types
@@ -71,8 +71,8 @@ classifyExplicitOperands op explicitOperands = do
 computeIORelation :: (Architecture arch)
                   => Opcode arch (Operand arch) sh
                   -> D.OperandList (Operand arch) sh
-                  -> [TestBundle (R.TestCase (ConcreteState arch)) (ExplicitFact arch)]
-                  -> [R.ResultOrError (ConcreteState arch)]
+                  -> [TestBundle (R.TestCase (CS.ConcreteState arch)) (ExplicitFact arch)]
+                  -> [R.ResultOrError (CS.ConcreteState arch)]
                   -> Learning arch (IORelation arch sh)
 computeIORelation opcode operands bundles results =
   F.foldlM (buildIORelation opcode operands idx) mempty bundles
@@ -94,9 +94,9 @@ buildIORelation :: forall arch sh
                  . (Architecture arch)
                 => Opcode arch (Operand arch) sh
                 -> D.OperandList (Operand arch) sh
-                -> ResultIndex (ConcreteState arch)
+                -> ResultIndex (CS.ConcreteState arch)
                 -> IORelation arch sh
-                -> TestBundle (R.TestCase (ConcreteState arch)) (ExplicitFact arch)
+                -> TestBundle (R.TestCase (CS.ConcreteState arch)) (ExplicitFact arch)
                 -> Learning arch (IORelation arch sh)
 buildIORelation op explicitOperands ri iorel tb = do
   -- If the set of explicit output locations discovered by this test bundle is
@@ -124,8 +124,8 @@ buildIORelation op explicitOperands ri iorel tb = do
 collectExplicitLocations :: (Architecture arch)
                          => D.OperandList (Operand arch) sh
                          -> [Some (PairF (D.Index sh) (TypedLocation arch))]
-                         -> ResultIndex (ConcreteState arch)
-                         -> R.TestCase (ConcreteState arch)
+                         -> ResultIndex (CS.ConcreteState arch)
+                         -> R.TestCase (CS.ConcreteState arch)
                          -> Learning arch (S.Set (Some (D.Index sh)))
 collectExplicitLocations _opList explicitLocs ri tc = do
   case M.lookup (R.testNonce tc) (riSuccesses ri) of
@@ -155,8 +155,8 @@ collectExplicitLocations _opList explicitLocs ri tc = do
 generateExplicitTestVariants :: forall arch
                               . (Architecture arch)
                              => Instruction arch
-                             -> ConcreteState arch
-                             -> Learning arch [TestBundle (ConcreteState arch) (ExplicitFact arch)]
+                             -> CS.ConcreteState arch
+                             -> Learning arch [TestBundle (CS.ConcreteState arch) (ExplicitFact arch)]
 generateExplicitTestVariants i s0 =
   case i of
     D.Instruction opcode operands -> do
@@ -165,7 +165,7 @@ generateExplicitTestVariants i s0 =
     genVar :: forall sh
             . Opcode arch (Operand arch) sh
            -> Some (PairF (D.Index sh) (TypedLocation arch))
-           -> Learning arch (TestBundle (ConcreteState arch) (ExplicitFact arch))
+           -> Learning arch (TestBundle (CS.ConcreteState arch) (ExplicitFact arch))
     genVar opcode (Some (PairF ix (TL loc))) = do
       cases <- generateVariantsFor s0 opcode ix loc
       return TestBundle { tbTestCases = cases
@@ -186,13 +186,15 @@ generateExplicitTestVariants i s0 =
 -- generate random bitvectors for floats, too, but we would probably want to
 -- tweak the distribution to generate interesting types of floats.
 generateVariantsFor :: (Architecture arch)
-                    => ConcreteState arch
+                    => CS.ConcreteState arch
                     -> Opcode arch (Operand arch) sh
                     -> D.Index sh tp
                     -> Location arch (OperandType arch tp)
-                    -> Learning arch [ConcreteState arch]
+                    -> Learning arch [CS.ConcreteState arch]
 generateVariantsFor s0 _opcode _ix loc = do
-  replicateM 20 (withGeneratedValueForLocation loc (\x -> MapF.insert loc x s0))
+  Just CS.
+  replicateM 20 (withGeneratedValueForLocation loc (\x -> CS.pokeMS MapF.insert loc x s0))
+--  replicateM 20 (withGeneratedValueForLocation loc (\x -> MapF.insert loc x s0))
 
 matchesOperand :: (Architecture arch)
                => Proxy arch
