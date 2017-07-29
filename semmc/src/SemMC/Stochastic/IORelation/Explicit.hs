@@ -19,8 +19,8 @@ import qualified Data.Set as S
 
 import qualified Data.Set.NonEmpty as NES
 import qualified Data.Parameterized.Classes as P
+import qualified Data.Parameterized.NatRepr as NR
 import Data.Parameterized.Some ( Some(..) )
-import qualified Data.Parameterized.Map as MapF
 
 import qualified Dismantle.Instruction as D
 import qualified Dismantle.Instruction.Random as D
@@ -37,7 +37,7 @@ import qualified SemMC.Stochastic.Remote as R
 --
 -- This could be made more efficient - right now, it just tries to generate
 -- random instructions until it gets a match.
-generateExplicitInstruction :: (Architecture arch, D.ArbitraryOperands (Opcode arch) (Operand arch))
+generateExplicitInstruction :: (CS.ConcreteArchitecture arch, D.ArbitraryOperands (Opcode arch) (Operand arch))
                             => Proxy arch
                             -> Opcode arch (Operand arch) sh
                             -> [Some (Location arch)]
@@ -54,7 +54,7 @@ generateExplicitInstruction proxy op implicitOperands = do
 -- | Generate test cases and send them off to the remote runner.  Collect and
 -- interpret the results to create an IORelation that describes the explicit
 -- operands of the instruction.
-classifyExplicitOperands :: (Architecture arch, D.ArbitraryOperands (Opcode arch) (Operand arch))
+classifyExplicitOperands :: (CS.ConcreteArchitecture arch, D.ArbitraryOperands (Opcode arch) (Operand arch))
                          => Opcode arch (Operand arch) sh
                          -> D.OperandList (Operand arch) sh
                          -> Learning arch (IORelation arch sh)
@@ -68,7 +68,7 @@ classifyExplicitOperands op explicitOperands = do
 
 -- | For all of the explicit operands, map the results of tests to deductions
 -- (forming an 'IORelation')
-computeIORelation :: (Architecture arch)
+computeIORelation :: (CS.ConcreteArchitecture arch)
                   => Opcode arch (Operand arch) sh
                   -> D.OperandList (Operand arch) sh
                   -> [TestBundle (R.TestCase (CS.ConcreteState arch)) (ExplicitFact arch)]
@@ -91,7 +91,7 @@ computeIORelation opcode operands bundles results =
 --    don't know, so don't conclude anything.  Future tests will figure out if
 --    it is an output.
 buildIORelation :: forall arch sh
-                 . (Architecture arch)
+                 . (CS.ConcreteArchitecture arch)
                 => Opcode arch (Operand arch) sh
                 -> D.OperandList (Operand arch) sh
                 -> ResultIndex (CS.ConcreteState arch)
@@ -123,7 +123,7 @@ buildIORelation op explicitOperands ri iorel tb = do
 -- If the test failed, return an empty set.
 collectExplicitLocations :: (Architecture arch)
                          => D.OperandList (Operand arch) sh
-                         -> [Some (PairF (D.Index sh) (TypedLocation arch))]
+                         -> [IndexedView arch sh] -- Some (PairF (D.Index sh) (TypedLocation arch))]
                          -> ResultIndex (CS.ConcreteState arch)
                          -> R.TestCase (CS.ConcreteState arch)
                          -> Learning arch (S.Set (Some (D.Index sh)))
@@ -132,9 +132,11 @@ collectExplicitLocations _opList explicitLocs ri tc = do
     Nothing -> return S.empty
     Just res -> F.foldrM (addLocIfDifferent (R.resultContext res)) S.empty explicitLocs
   where
-    addLocIfDifferent resCtx (Some (PairF idx (TL opLoc))) s
-      | Just output <- MapF.lookup opLoc resCtx
-      , Just input <- MapF.lookup opLoc (R.testContext tc) =
+    addLocIfDifferent resCtx (IndexedView idx (Some opLoc)) s -- (Some (PairF idx (TL opLoc))) s
+      | output <- NR.withKnownNat (CS.viewTypeRepr opLoc) (CS.peekMS resCtx opLoc)
+        -- MapF.lookup opLoc resCtx
+      , input <- NR.withKnownNat (CS.viewTypeRepr opLoc) (CS.peekMS (R.testContext tc) opLoc) =
+        -- MapF.lookup opLoc (R.testContext tc) =
           case input /= output of
             True -> return (S.insert (Some idx) s)
             False -> return s
@@ -153,7 +155,7 @@ collectExplicitLocations _opList explicitLocs ri tc = do
 -- We learn the *outputs* set by comparing the tweaked input vs the output from
 -- that test vector: all modified registers are in the output set.
 generateExplicitTestVariants :: forall arch
-                              . (Architecture arch)
+                              . (CS.ConcreteArchitecture arch)
                              => Instruction arch
                              -> CS.ConcreteState arch
                              -> Learning arch [TestBundle (CS.ConcreteState arch) (ExplicitFact arch)]
@@ -164,10 +166,10 @@ generateExplicitTestVariants i s0 =
   where
     genVar :: forall sh
             . Opcode arch (Operand arch) sh
-           -> Some (PairF (D.Index sh) (TypedLocation arch))
+           -> IndexedView arch sh -- Some (PairF (D.Index sh) (TypedLocation arch))
            -> Learning arch (TestBundle (CS.ConcreteState arch) (ExplicitFact arch))
-    genVar opcode (Some (PairF ix (TL loc))) = do
-      cases <- generateVariantsFor s0 opcode ix loc
+    genVar opcode (IndexedView ix (Some loc)) = do -- (Some (PairF ix (TL loc))) = do
+      cases <- generateVariantsFor s0 opcode ix (Some loc)
       return TestBundle { tbTestCases = cases
                         , tbResult = ExplicitFact { lOpcode = opcode
                                                   , lIndex = ix
@@ -189,11 +191,10 @@ generateVariantsFor :: (Architecture arch)
                     => CS.ConcreteState arch
                     -> Opcode arch (Operand arch) sh
                     -> D.Index sh tp
-                    -> Location arch (OperandType arch tp)
+                    -> Some (CS.View arch) -- Location arch (OperandType arch tp)
                     -> Learning arch [CS.ConcreteState arch]
-generateVariantsFor s0 _opcode _ix loc = do
-  Just CS.
-  replicateM 20 (withGeneratedValueForLocation loc (\x -> CS.pokeMS MapF.insert loc x s0))
+generateVariantsFor s0 _opcode _ix (Some v) = do
+  replicateM 20 (withGeneratedValueForLocation v (\x -> CS.pokeMS s0 v x)) -- MapF.insert v x s0))
 --  replicateM 20 (withGeneratedValueForLocation loc (\x -> MapF.insert loc x s0))
 
 matchesOperand :: (Architecture arch)

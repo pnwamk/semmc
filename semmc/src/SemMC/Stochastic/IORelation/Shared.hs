@@ -88,38 +88,28 @@ indexResults ri res =
     R.TestSuccess tr ->
       ri { riSuccesses = M.insert (R.resultNonce tr) tr (riSuccesses ri) }
 
--- data PairF a b tp = PairF (a tp) (b tp)
-
 -- | A view of a location, indexed by its position in the operand list
-data IndexedView arch where
-  IndexedView :: D.Index sh tp -> Some (CS.View arch) -> IndexedView arch
+data IndexedView arch sh where
+  IndexedView :: D.Index sh tp -> Some (CS.View arch) -> IndexedView arch sh
 
--- FIXME: have this return a view
 instructionRegisterOperands :: forall arch sh proxy
                              . (CS.ConcreteArchitecture arch)
                             => proxy arch
                             -> D.OperandList (Operand arch) sh
-                            -> [IndexedView arch] -- Some (PairF (D.Index sh) (TypedLocation arch))]
+                            -> [IndexedView arch sh]
 instructionRegisterOperands proxy operands =
   D.foldrOperandList collectLocations [] operands
   where
     collectLocations :: forall tp . D.Index sh tp
                      -> Operand arch tp
-                     -> [IndexedView arch] -- Some (PairF (D.Index sh) (TypedLocation arch))]
-                     -> [IndexedView arch] -- Some (PairF (D.Index sh) (TypedLocation arch))]
+                     -> [IndexedView arch sh]
+                     -> [IndexedView arch sh]
     collectLocations ix operand acc =
       case CS.operandToView proxy operand of
         Just v -> IndexedView ix v : acc
-          -- Some (PairF ix (TL loc)) : acc
         Nothing -> acc
 
 -- | Return all of the locations referenced in the architecture state
---
--- FIXME: convert to return views
---
--- FIXME: We might want to have a method on the ConcreteArchitecture class for
--- this, as it is really a constant (and it probably should return all possible
--- views, instead of locations)
 testCaseLocations :: forall proxy arch
                    . (CS.ConcreteArchitecture arch)
                   => proxy arch
