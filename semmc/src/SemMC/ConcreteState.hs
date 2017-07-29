@@ -15,7 +15,6 @@ module SemMC.ConcreteState
   , viewTypeRepr
   , trivialView
   , someTrivialView
-  , BVLocation(..)
   , Slice(..)
   , peekSlice
   , pokeSlice
@@ -28,8 +27,6 @@ module SemMC.ConcreteState
   , ConcreteArchitecture(..)
   ) where
 
-import qualified GHC.Err.Located as L
-
 import           Data.Bits ( Bits, complement, (.&.), (.|.), shiftL, shiftR )
 import qualified Data.ByteString as B
 import           Data.Maybe ( fromJust, fromMaybe )
@@ -41,7 +38,6 @@ import qualified Data.Word.Indexed as W
 import           GHC.TypeLits ( KnownNat, Nat, type (+), type (<=) )
 
 import qualified Dismantle.Arbitrary as A
-import           Data.Parameterized.Witness ( Witness(..) )
 
 import           Lang.Crucible.BaseTypes ( BaseBVType, BaseTypeRepr(..) )
 
@@ -175,21 +171,19 @@ instance (Architecture arch) => OrdF (View arch) where
       EQF -> compareSliceF s1 s2
 
 -- | Produce a view of an entire location
-trivialView :: forall arch n . (KnownNat n, 1 <= n) => Location arch (BaseBVType n) -> View arch n
-trivialView loc = View s loc
+trivialView :: forall proxy arch n . (KnownNat n, 1 <= n) => proxy arch -> Location arch (BaseBVType n) -> View arch n
+trivialView _ loc = View s loc
   where
     s :: Slice n n
     s = Slice (knownNat :: NatRepr n) (knownNat :: NatRepr n) (knownNat :: NatRepr 0) (knownNat :: NatRepr n)
 
-newtype BVLocation arch n = BVLocation (Location arch (BaseBVType n))
-
 someTrivialView :: (ConcreteArchitecture arch)
                 => proxy arch
-                -> Some (Witness KnownNat (BVLocation arch))
-                -> Some (Witness KnownNat (View arch))
-someTrivialView _ (Some (Witness (BVLocation loc))) =
+                -> Some (Location arch)
+                -> Some (View arch)
+someTrivialView proxy (Some loc) =
   case locationType loc of
-    BaseBVRepr nr -> withKnownNat nr (Some (Witness (trivialView loc)))
+    BaseBVRepr nr -> withKnownNat nr (Some (trivialView proxy loc))
 --    lt -> L.error ("Unsupported location type: " ++ show lt)
 
 onesMask :: (Integral a, Bits b, Num b) => a -> b

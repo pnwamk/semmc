@@ -18,10 +18,9 @@ import Data.Proxy ( Proxy(..) )
 import qualified Data.Set as S
 
 import qualified Data.Set.NonEmpty as NES
-import qualified Data.Parameterized.Classes as P
 import qualified Data.Parameterized.Map as MapF
 import Data.Parameterized.Some ( Some(..) )
-import Data.Parameterized.Witness ( Witness(..) )
+import Lang.Crucible.BaseTypes
 
 import qualified Dismantle.Instruction as D
 import qualified Dismantle.Instruction.Random as D
@@ -92,7 +91,7 @@ collectImplicitOutputLocations :: forall arch sh
                                -> ResultIndex (CS.ConcreteState arch)
                                -> ImplicitFact arch
                                -> R.TestCase (CS.ConcreteState arch)
-                               -> Learning arch (IORelation arch sh) -- S.Set (Some (Location arch)))
+                               -> Learning arch (IORelation arch sh)
 collectImplicitOutputLocations _op rix f tc =
   case M.lookup (R.testNonce tc) (riSuccesses rix) of
     Nothing -> return mempty
@@ -103,22 +102,28 @@ collectImplicitOutputLocations _op rix f tc =
                      } ->
           F.foldrM (addLocIfImplicitAndDifferent loc0 explicitOperands) mempty (MapF.toList (R.resultContext res))
   where
-    -- FIXME: Can we use the `locationType` function to get a type repr here for the size of the location?
-    --
-    -- Here we are iterating over locations in the state, not views...
+    addLocIfImplicitAndDifferent :: Some (CS.View arch)
+                                 -> S.Set (Some (CS.View arch))
+                                 -> MapF.Pair (Location arch) CS.Value
+                                 -> IORelation arch sh
+                                 -> Learning arch (IORelation arch sh)
     addLocIfImplicitAndDifferent loc0 explicitOperands (MapF.Pair loc postVal) s =
-      case CS.someTrivialView (Proxy :: Proxy arch) (Some (Witness (CS.BVLocation loc))) of
-        Some someView ->
-          let preVal = CS.peekMS (R.testContext tc) someView
-          in case () of
-            () | Some preVal == Some postVal -> return s
-               | Some someView /= loc0 && S.member (Some someView) explicitOperands ->
-                 return s { inputs = S.insert (ImplicitOperand loc0) (inputs s) }
-               | Some someView /= loc0 ->
-                 return s { inputs = S.insert (ImplicitOperand loc0) (inputs s)
-                          , outputs = S.insert (ImplicitOperand (Some someView)) (outputs s)
-                          }
-               | otherwise -> return s
+      let proxy = Proxy :: Proxy arch
+      in case locationType loc of
+        BaseBVRepr nr ->
+          case withKnownNat nr (let tv = CS.trivialView proxy loc
+                                in (CS.peekMS (R.testContext tc) tv, tv)) of
+            (preVal, tv) ->
+              case () of
+                () | Some preVal == Some postVal -> return s
+                   | Some tv /= loc0 && S.member (Some tv) explicitOperands ->
+                     return s { inputs = S.insert (ImplicitOperand loc0) (inputs s) }
+                   | Some tv /= loc0 ->
+                     return s { inputs = S.insert (ImplicitOperand loc0) (inputs s)
+                              , outputs = S.insert (ImplicitOperand (Some tv)) (outputs s)
+                              }
+                   | otherwise -> return s
+        lt -> L.error ("Unexpected location type: " ++ show lt)
 
 -- | For an instruction instance, sweep across the parameter space of all of the
 -- interesting values for the operands.  Examine all of the locations that do
@@ -141,7 +146,7 @@ genTestForLoc :: forall arch
               -> Some (CS.View arch)
               -> Learning arch (TestBundle (CS.ConcreteState arch) (ImplicitFact arch))
 genTestForLoc i s0 (Some loc0) = do
-  testStates <- replicateM 20 (withGeneratedValueForLocation loc0 (\x -> MapF.insert loc0 x s0))
+  testStates <- replicateM 20 (withGeneratedValueForLocation loc0 (CS.pokeMS s0 loc0))
   case i of
     D.Instruction _ ops -> do
       let explicits = [ v

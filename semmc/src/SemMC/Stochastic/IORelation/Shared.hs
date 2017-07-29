@@ -120,13 +120,15 @@ instructionRegisterOperands proxy operands =
 -- FIXME: We might want to have a method on the ConcreteArchitecture class for
 -- this, as it is really a constant (and it probably should return all possible
 -- views, instead of locations)
-testCaseLocations :: (Architecture arch)
+testCaseLocations :: forall proxy arch
+                   . (CS.ConcreteArchitecture arch)
                   => proxy arch
                   -> CS.ConcreteState arch
-                  -> [Some (Location arch)]
-testCaseLocations _ = MapF.foldrWithKey getKeys []
+                  -> [Some (CS.View arch)]
+testCaseLocations proxy = MapF.foldrWithKey getKeys []
   where
-    getKeys k _ acc = Some k : acc
+    getKeys :: forall a s . Location arch s -> a s -> [Some (CS.View arch)] -> [Some (CS.View arch)]
+    getKeys k _ acc = CS.someTrivialView proxy (Some k) : acc
 
 withGeneratedValueForLocation :: forall arch n a
                                . (Architecture arch)
