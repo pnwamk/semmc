@@ -90,6 +90,15 @@ data Slice (m :: Nat) (n :: Nat) where
            , b <= n)    -- The last bit (b) doesn't run off the end of the location (n)
         => NatRepr m -> NatRepr n -> NatRepr a -> NatRepr b -> Slice m n
 
+instance Show (Slice m n) where
+  show (Slice m n a b) = unwords [ "Slice"
+                                 , show m
+                                 , show n
+                                 , show a
+                                 , show b
+                                 ]
+instance ShowF (Slice m)
+
 instance Eq (Slice m n) where
   Slice _ _ a1 b1 == Slice _ _ a2 b2 = fromMaybe False $ do
     Refl <- testEquality a1 a2
@@ -146,6 +155,10 @@ instance (Architecture arch) => TestEquality (View arch) where
     Refl <- testEquality a1 a2
     Refl <- testEquality b1 b2
     return Refl
+
+instance (Architecture arch) => Show (View arch m) where
+  show (View s loc) = "View " ++ showF s ++ " " ++ showF loc
+instance (Architecture arch) => ShowF (View arch)
 
 compareSliceF :: Slice m1 n1 -> Slice m2 n2 -> OrderingF m1 m2
 compareSliceF (Slice m1 n1 a1 b1) (Slice m2 n2 a2 b2) =
