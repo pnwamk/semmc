@@ -296,8 +296,11 @@ void snapshotRegisterState(pid_t childPid, uint8_t* memSpace, RegisterState* rs)
   LR is r14
   SP is r13
  */
+#define CAST_PTR(x) ((unsigned int)(x))
 uint8_t raiseTrap[] = {0xe7, 0xff, 0xde, 0xfe};
-#define RAISE_TRAP asm("trap")
+#define RAISE_TRAP asm("bkpt")
+
+typedef unsigned long elf_gregset_t[18];
 
 #define SEM_NGPRS 16
 #define SEM_NFPRS 32 // single precision
@@ -312,7 +315,7 @@ typedef struct {
 } RegisterState;
 
 void setupRegisterState(pid_t childPid, uint8_t* programSpace, uint8_t* memSpace, RegisterState* rs) {
-  struct elf_gregset_t regs;
+  elf_gregset_t regs;
   struct iovec iov;
   iov.iov_base = &regs;
   iov.iov_len = sizeof(regs);
@@ -339,7 +342,7 @@ void setupRegisterState(pid_t childPid, uint8_t* programSpace, uint8_t* memSpace
 }
 
 void snapshotRegisterState(pid_t childPid, uint8_t* memSpace, RegisterState* rs) {
-  struct user_regs_struct regs;
+  elf_gregset_t regs;
   struct iovec iov;
   iov.iov_base = &regs;
   iov.iov_len = sizeof(regs);
