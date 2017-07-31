@@ -43,6 +43,9 @@ import           Data.Parameterized.NatRepr ( NatRepr, widthVal, knownNat, withK
 import           Data.Parameterized.Some ( Some(..) )
 import qualified Data.Word.Indexed as W
 import           GHC.TypeLits ( KnownNat, Nat, type (+), type (<=) )
+import qualified Text.Megaparsec as P
+import qualified Text.Megaparsec.Char as P
+import qualified Text.Megaparsec.Char.Lexer as P
 
 import qualified Dismantle.Arbitrary as A
 
@@ -251,6 +254,12 @@ class (Architecture arch) => ConcreteArchitecture arch where
 
   showView :: View arch n -> String
 
+type Parser = P.Parsec String String
+
+parseView :: Parser (Some (Location arch)) -> Parser (Some (View arch))
+parseView parseLoc = do
+  loc <- parseLoc
+  undefined
 
 -- Boring instances
 
