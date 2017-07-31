@@ -34,6 +34,9 @@ import           SemMC.Architecture.PPC.Location
 
 type ConcreteState = MapF.MapF Location CS.Value
 
+readView :: String -> Maybe (Some (CS.View arch))
+readView s = undefined
+
 -- | FIXME: Does not include memory
 randomState :: A.Gen -> IO ConcreteState
 randomState gen = St.execStateT randomize MapF.empty
