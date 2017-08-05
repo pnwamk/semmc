@@ -386,12 +386,13 @@ typedef struct {
   uint32_t cr;
   uint64_t fpscr;
   VR vsrs[SEM_NVSRS];
-  uint8_t mem1[MEM_REGION_BYTES];
-  uint8_t mem2[MEM_REGION_BYTES];
+  /* uint8_t mem1[MEM_REGION_BYTES]; */
+  /* uint8_t mem2[MEM_REGION_BYTES]; */
 } RegisterState;
 
 void setupRegisterState(pid_t childPid, uint8_t *programSpace, uint8_t *memSpace, RegisterState *rs) {
   struct pt_regs regs;
+  memset(&regs, 0, sizeof(regs));
 
   checkedPtrace(PTRACE_GETREGS, childPid, 0, (void *) &regs);
 
@@ -418,10 +419,10 @@ void setupRegisterState(pid_t childPid, uint8_t *programSpace, uint8_t *memSpace
     regs.gpr[i] = rs->gprs[i];
   }
 //  regs.msr  = rs->msr;
-  regs.ctr  = rs->ctr;
-  regs.link = rs->link;
-  regs.xer  = rs->xer;
-  regs.ccr  = rs->cr;
+  regs.ctr  = 0; // rs->ctr;
+  regs.link = 0; // rs->link;
+  regs.xer  = 0; // rs->xer;
+  regs.ccr  = 0; // rs->cr;
 
   // Set the IP to be at the start of our test program
   regs.nip = CAST_PTR(programSpace);
@@ -436,15 +437,17 @@ void setupRegisterState(pid_t childPid, uint8_t *programSpace, uint8_t *memSpace
     fpregs[i] = rs->vsrs[i].chunks[0];
   }
   fpregs[SEM_NFPRS] = rs->fpscr;
+
   checkedPtrace(PTRACE_SETFPREGS, childPid, 0, (void *) &fpregs);
 
-  uint64_t vsrhalves[SEM_NFPRS];
-  checkedPtrace(PTRACE_GETVSRREGS, childPid, 0, (void *) &vsrhalves);
-  // Set up the other halves of the low VSR registers
-  for (int i = 0; i < SEM_NFPRS; i++) {
-    vsrhalves[i] = rs->vsrs[i].chunks[1];
-  }
-  checkedPtrace(PTRACE_SETVSRREGS, childPid, 0, (void *) &vsrhalves);
+  /* uint64_t vsrhalves[SEM_NFPRS*]; */
+  /* checkedPtrace(PTRACE_GETVSRREGS, childPid, 0, (void *) &vsrhalves); */
+  /* // Set up the other halves of the low VSR registers */
+  /* for (int i = 0; i < SEM_NFPRS; i++) { */
+  /*   vsrhalves[i] = rs->vsrs[i].chunks[1]; */
+  /* } */
+
+  /* checkedPtrace(PTRACE_SETVSRREGS, childPid, 0, (void *) &vsrhalves); */
 
   // Anonymous struct to ensure proper alignment
   struct {
@@ -457,11 +460,23 @@ void setupRegisterState(pid_t childPid, uint8_t *programSpace, uint8_t *memSpace
   for (int i = 0; i < SEM_NVRS; i++) {
     vrbuf.vrregs[i] = rs->vsrs[SEM_NFPRS + i];
   }
+
   checkedPtrace(PTRACE_SETVRREGS, childPid, 0, (void *) &vrbuf);
 }
 
 void snapshotRegisterState(pid_t childPid, uint8_t* memSpace, RegisterState* rs) {
+  elf_gregset_t regs2;
+  memset(regs2, 0, sizeof(regs2));
+  struct iovec iov;
+  iov.iov_base = &regs2;
+  iov.iov_len = sizeof(regs2);
+  fprintf(stderr, "Trying to use PTRACE_GETREGSET\n");
+  checkedPtrace(PTRACE_GETREGSET, childPid, (void*)NT_PRSTATUS, &iov);
+  assert(iov.iov_len == sizeof(regs2));
+
+  /*
   struct pt_regs regs;
+  memset(&regs, 0, sizeof(regs));
 
   checkedPtrace(PTRACE_GETREGS, childPid, 0, (void *) &regs);
 
@@ -473,8 +488,17 @@ void snapshotRegisterState(pid_t childPid, uint8_t* memSpace, RegisterState* rs)
   rs->link = regs.link;
   rs->xer = regs.xer;
   rs->cr = regs.ccr;
+  */
+  for(int i = 0; i < SEM_NGPRS; ++i) {
+    rs->gprs[i] = regs2[i];
+  }
+  rs->ctr = regs2[35];
+  rs->link = regs2[36];
+  rs->xer = regs2[37];
+  rs->cr = regs2[38];
 
   uint64_t fpregs[SEM_NFPRS+1];
+  memset(fpregs, 0, sizeof(fpregs));
 
   checkedPtrace(PTRACE_GETFPREGS, childPid, 0, (void *) &fpregs);
 
@@ -484,14 +508,14 @@ void snapshotRegisterState(pid_t childPid, uint8_t* memSpace, RegisterState* rs)
   }
   rs->fpscr = fpregs[SEM_NFPRS];
 
-  uint64_t vsrhalves[SEM_NFPRS];
+  /* uint64_t vsrhalves[SEM_NFPRS]; */
 
-  checkedPtrace(PTRACE_GETVSRREGS, childPid, 0, (void *) &vsrhalves);
+  /* checkedPtrace(PTRACE_GETVSRREGS, childPid, 0, (void *) &vsrhalves); */
 
-  // Copy in the other halves of the low VSR regs
-  for (int i = 0; i < SEM_NFPRS; i++) {
-    rs->vsrs[i].chunks[1] = vsrhalves[i];
-  }
+  /* // Copy in the other halves of the low VSR regs */
+  /* for (int i = 0; i < SEM_NFPRS; i++) { */
+  /*   rs->vsrs[i].chunks[1] = vsrhalves[i]; */
+  /* } */
 
   // Anonymous struct to ensure proper alignment
   struct {
@@ -500,6 +524,7 @@ void snapshotRegisterState(pid_t childPid, uint8_t* memSpace, RegisterState* rs)
     uint32_t vrweird;
   } vrbuf;
 
+  memset(&vrbuf, 0, sizeof(vrbuf));
   checkedPtrace(PTRACE_GETVRREGS, childPid, 0, (void *) &vrbuf);
 
   // Copy in the VR regs

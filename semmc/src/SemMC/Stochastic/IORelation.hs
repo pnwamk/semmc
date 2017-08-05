@@ -54,6 +54,9 @@ import SemMC.Stochastic.IORelation.Implicit ( findImplicitOperands )
 import SemMC.Stochastic.IORelation.Parser
 import SemMC.Stochastic.IORelation.Types
 
+import Debug.Trace
+import Text.Printf ( printf )
+
 data LearningConfig arch =
   LearningConfig { lcIORelationDirectory :: FilePath
                  , lcNumThreads :: Int
@@ -156,6 +159,7 @@ learn = do
   case mop of
     Nothing -> return ()
     Just (Some op) -> do
+      traceM $ printf "Testing opcode %s\n" (P.showF op)
       rel <- testOpcode op
       recordLearnedRelation op rel
       learn
@@ -165,8 +169,12 @@ testOpcode :: forall arch sh
            => Opcode arch (Operand arch) sh
            -> Learning arch (IORelation arch sh)
 testOpcode op = do
+  traceM "Trying to find implicit operands"
   implicitOperands <- findImplicitOperands op
+  traceM "Found implicits"
+  traceM (show implicitOperands)
   insn <- generateExplicitInstruction (Proxy @arch) op (implicitLocations implicitOperands)
+--  IO.hPutStrLn IO.stderr $ printf "Generated an explicit instruction: %s\n" (
   case insn of
     D.Instruction op' operandList
       | Just P.Refl <- P.testEquality op op' -> do

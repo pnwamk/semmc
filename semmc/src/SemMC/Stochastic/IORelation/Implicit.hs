@@ -18,6 +18,7 @@ import Data.Proxy ( Proxy(..) )
 import qualified Data.Set as S
 
 import qualified Data.Set.NonEmpty as NES
+import qualified Data.Parameterized.Classes as P
 import qualified Data.Parameterized.Map as MapF
 import Data.Parameterized.Some ( Some(..) )
 import Lang.Crucible.BaseTypes
@@ -32,6 +33,8 @@ import SemMC.Stochastic.IORelation.Shared
 import SemMC.Stochastic.IORelation.Types
 import qualified SemMC.Stochastic.Remote as R
 
+import Debug.Trace
+import Text.Printf ( printf )
 -- | Sweep through the parameter space to find locations not mentioned in
 -- parameter lists that are modified by the instruction.
 --
@@ -82,25 +85,45 @@ buildImplicitRelation :: (CS.ConcreteArchitecture arch)
                       -> TestBundle (TestCase arch) (ImplicitFact arch)
                       -> Learning arch (IORelation arch sh)
 buildImplicitRelation op rix iorel tb = do
-  implicitLocs <- mconcat <$> mapM (collectImplicitOutputLocations op rix (tbResult tb)) (tbTestCases tb)
+  implicitLocs <- mconcat <$> mapM (collectImplicitOutputLocations op rix (tbTestBase tb) baseRes (tbResult tb)) (tbTestCases tb)
   return (iorel <> implicitLocs)
+  where
+    Just baseRes = M.lookup (R.testNonce (tbTestBase tb)) (riSuccesses rix)
+
+{-# NOINLINE traceStates #-}
+traceStates baseCase tc baseRes res = do
+              traceM $ printf "  Initial base:         %s" (show (R.testContext baseCase))
+              traceM $ printf "  Initial Tweaked:      %s" (show (R.testContext tc))
+              traceM $ printf "  Base result state:    %s" (show (R.resultContext baseRes))
+              traceM $ printf "  Tweaked result state: %s" (show (R.resultContext res))
 
 collectImplicitOutputLocations :: forall arch sh
                                 . (CS.ConcreteArchitecture arch)
                                => Opcode arch (Operand arch) sh
                                -> ResultIndex (CS.ConcreteState arch)
+                               -> R.TestCase (CS.ConcreteState arch) (Instruction arch)
+                               -> R.TestResult (CS.ConcreteState arch)
                                -> ImplicitFact arch
                                -> TestCase arch
                                -> Learning arch (IORelation arch sh)
-collectImplicitOutputLocations _op rix f tc =
+collectImplicitOutputLocations _op rix baseCase baseRes f tc =
   case M.lookup (R.testNonce tc) (riSuccesses rix) of
     Nothing -> return mempty
     Just res ->
-      case f of
-        ImplicitFact { ifExplicits = explicitOperands
-                     , ifLocation = loc0
-                     } ->
-          F.foldrM (addLocIfImplicitAndDifferent loc0 explicitOperands) mempty (MapF.toList (R.resultContext res))
+      -- case M.lookup (R.testNonce baseCase) (riSuccesses rix) of
+      --   Nothing -> trace (printf "Failed to execute base test case with nonce %d\n" (R.testNonce baseCase)) $ return mempty
+      --   Just baseRes ->
+          case f of
+            ImplicitFact { ifExplicits = explicitOperands
+                         , ifLocation = loc0
+                         , ifInstruction = ii
+                         } -> do
+              traceM $ printf "\n\nTest nonce is %d, testing location %s" (R.testNonce tc) (show loc0)
+              traceM $ printf "  Test instruction: %s" (show ii)
+              traceM $ printf "  Test program bytes are: %s" (show (R.testProgram tc))
+              traceM $ printf "  Explicit locations: %s" (show explicitOperands)
+              traceStates baseCase tc baseRes res
+              F.foldrM (addLocIfImplicitAndDifferent loc0 explicitOperands) mempty (MapF.toList (R.resultContext res))
   where
     addLocIfImplicitAndDifferent :: Some (CS.View arch)
                                  -> S.Set (Some (CS.View arch))
@@ -112,16 +135,21 @@ collectImplicitOutputLocations _op rix f tc =
       in case locationType loc of
         BaseBVRepr nr ->
           case withKnownNat nr (let tv = CS.trivialView proxy loc
-                                in (CS.peekMS (R.testContext tc) tv, tv)) of
-            (preVal, tv) ->
+                                in (CS.peekMS (R.testContext tc) tv, CS.peekMS (R.resultContext baseRes) tv,tv)) of
+            (_preVal, baseResVal, tv) ->
               case () of
-                () | Some preVal == Some postVal -> return s
-                   | Some tv /= loc0 && S.member (Some tv) explicitOperands ->
-                     return s { inputs = S.insert (ImplicitOperand loc0) (inputs s) }
-                   | Some tv /= loc0 ->
+                () | Some baseResVal == Some postVal -> return s
+                   | Some tv /= loc0 && not (S.member (Some tv) explicitOperands) && not (S.member loc0 explicitOperands) ->
+                     trace (printf "  (1) Difference in values at location %s (loc0=%s): base=%s post=%s" (P.showF tv) (show loc0) (P.showF baseResVal) (P.showF postVal)) $
                      return s { inputs = S.insert (ImplicitOperand loc0) (inputs s)
                               , outputs = S.insert (ImplicitOperand (Some tv)) (outputs s)
                               }
+                   | Some tv /= loc0 && not (S.member loc0 explicitOperands) && S.member (Some tv) explicitOperands ->
+                       trace (printf "  (2) Difference in values at location %s (loc0=%s): base=%s post=%s" (P.showF tv) (show loc0) (P.showF baseResVal) (P.showF postVal)) $
+                     return s { inputs = S.insert (ImplicitOperand loc0) (inputs s) }
+                   | Some tv /= loc0 && S.member loc0 explicitOperands && not (S.member (Some tv) explicitOperands) ->
+                       trace (printf "  (3) Difference in values at location %s (loc0=%s): base=%s post=%s" (P.showF tv) (show loc0) (P.showF baseResVal) (P.showF postVal)) $
+                     return s { outputs = S.insert (ImplicitOperand (Some tv)) (outputs s) }
                    | otherwise -> return s
         lt -> L.error ("Unexpected location type: " ++ show lt)
 
@@ -154,6 +182,7 @@ genTestForLoc i s0 (Some loc0) = do
                           <- instructionRegisterOperands (Proxy :: Proxy arch) ops
                       ]
       return TestBundle { tbTestCases = testStates
+                        , tbTestBase = s0
                         , tbResult = ImplicitFact { ifExplicits = S.fromList explicits
                                                   , ifLocation = Some loc0
                                                   , ifInstruction = i
