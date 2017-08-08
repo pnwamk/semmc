@@ -62,6 +62,9 @@
 // The number of bytes for our hand-allocated memory regions
 #define MEM_REGION_BYTES 32
 
+int pageSize;
+int waitForSignal(pid_t);
+
 #define LOG_FILE "/tmp/remote-runner.log"
 #if defined(LOGGING)
 
@@ -533,6 +536,47 @@ void snapshotRegisterState(pid_t childPid, uint8_t* memSpace, RegisterState* rs)
   }
 }
 
+uint8_t flushStack[4096];
+
+void ppcFlush(uint8_t* programSpace) {
+//  LOG("ppcFlush at %x\n", CAST_PTR(programSpace));
+  const int cacheLineSize = 1;
+  for(int i = 0; i < pageSize; i+=cacheLineSize) {
+    asm("dcbf %[program], %[lineAddr]"
+        :
+        : [lineAddr] "r" (i),  [program] "r" (programSpace)
+        );
+  }
+  asm("sync");
+  for(int i = 0; i < pageSize; i+=cacheLineSize) {
+    asm("icbi %[program], %[lineAddr]"
+        :
+        : [lineAddr] "r" (i),  [program] "r" (programSpace)
+        );
+  }
+  asm("sync");
+  asm("isync");
+//  LOG("Flushed icache at %x\n", CAST_PTR(programSpace));
+  RAISE_TRAP;
+}
+
+void flushICache(pid_t childPid, uint8_t* programSpace) {
+  struct pt_regs regs;
+  checkedPtrace(PTRACE_GETREGS, childPid, 0, (void*)&regs);
+  // The first argument to ppcFlush goes in r3 (according to the PPC calling
+  // convention).
+  regs.gpr[1] = CAST_PTR(flushStack) + 4000;
+  regs.gpr[3] = CAST_PTR(programSpace);
+  regs.nip = CAST_PTR(ppcFlush);
+  LOG("Attempting to flush icache at %x with flush function at %x\n", CAST_PTR(programSpace), CAST_PTR(ppcFlush));
+  checkedPtrace(PTRACE_SETREGS, childPid, 0, (void*)&regs);
+  checkedPtrace(PTRACE_CONT, childPid, NULL, NULL);
+  // This runs ppcFlush, which ends in a trap.  That will put us back into the
+  // invariant state where the tracee is stopped.
+  int sig = waitForSignal(childPid);
+  LOG("Flush signal was %d\n", sig);
+}
+
 #endif
 
 #endif
@@ -642,7 +686,7 @@ WorkTag readWorkItem(FILE* stream, WorkItem* item) {
     return WORK_ERROR_NONONCE;
   }
 
-  LOG("  nonce = %llu\n", item->nonce);
+  LOG("  nonce = %llu\n", le64toh(item->nonce));
 
   uint16_t regStateBytes;
   nItems = fread(&regStateBytes, 1, sizeof(regStateBytes), stream);
@@ -713,6 +757,9 @@ ResponseTag processWorkItem(pid_t childPid, uint8_t* programSpace, uint8_t* memS
   int sig;
 
   mapProgram(programSpace, item);
+  // NOTE: We flush the icache before we set up the register state, as flushing
+  // the will require mucking with register values.
+  flushICache(childPid, programSpace);
   setupRegisterState(childPid, programSpace, memSpace, &item->regs);
   LOG("Sending SIGCONT\n");
   checkedPtrace(PTRACE_CONT, childPid, NULL, NULL);
@@ -846,7 +893,7 @@ int traceChild(pid_t childPid, uint8_t* programSpace, uint8_t* memSpace) {
       writeReadErrorResult(stdout, tag, "Fork failed");
       break;
     case WORK_ITEM: {
-      LOG("Got a work item with nonce %llu\n", item.nonce);
+      LOG("Got a work item with nonce %llu\n", le64toh(item.nonce));
       RegisterState postState;
       memset(&postState, 0, sizeof(postState));
       rtag = processWorkItem(childPid, programSpace, memSpace, &item, &postState);
