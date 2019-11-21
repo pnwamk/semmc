@@ -122,7 +122,7 @@ sexprConvertFunction (FunctionFormula { ffName = name
                                       }) =
   SE.L [ SE.L [ SE.A (AIdent "function"), SE.A (AIdent name)]
        , SE.L [ SE.A (AIdent "arguments"), convertArgumentVars argTypes argVars ]
-       , SE.L [ SE.A (AIdent "ret"), convertBaseType retType ]
+       , SE.L [ SE.A (AIdent "return"), convertBaseType retType ]
        , SE.L [ SE.A (AIdent "body"), convertFnBody def ]
        ]
 
@@ -457,7 +457,7 @@ convertAppExpr' paramLookup = go . S.appExprApp
         -- (S.IntDivisible _ _)
         -- (S.RealDiv _ _)
         -- (S.RealSqrt _)
-        --go app = error $ "unhandled App: " ++ show app
+        go app = error $ "unhandled App: " ++ show app
 
 
         -- -- -- -- Helper functions! -- -- -- --
