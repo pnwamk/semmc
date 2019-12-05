@@ -8,7 +8,6 @@ packages:
   semmc-coverage/
   submodules/dismantle/dismantle-tablegen/
   submodules/dismantle/dismantle-arm/
-  submodules/dismantle/dismantle-arm-xml/
   submodules/dismantle/dismantle-thumb/
   submodules/dismantle/dismantle-ppc/
 
