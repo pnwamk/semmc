@@ -54,6 +54,8 @@ import           What4.BaseTypes
 import qualified Lang.Crucible.Backend as S
 import qualified What4.Interface as S
 import           What4.Symbol ( userSymbol )
+import qualified What4.Serialize.Parser as WSP
+import           What4.Serialize.SETokens
 
 import qualified Data.Type.List as TL -- in this package
 import qualified SemMC.Architecture as A
@@ -61,7 +63,6 @@ import qualified SemMC.Architecture.Location as L
 import qualified SemMC.BoundVar as BV
 import           SemMC.Formula.Env ( FormulaEnv(..), SomeSome(..) )
 import           SemMC.Formula.Formula
-import           SemMC.Formula.SETokens
 import qualified SemMC.Util as U
 
 import           Prelude
@@ -78,7 +79,7 @@ data ParsedParameter arch (tps :: [BaseType]) (tp :: BaseType) where
                          -> ParsedParameter arch tps tp
   ParsedLiteralParameter :: L.Location arch tp -> ParsedParameter arch tps tp
 
--- Translating from 'SL.Index' on 'BaseType' to 'SL.Index' on 'Symbol' is
+-- Translating from 'SL.Index'   on 'BaseType' to 'SL.Index' on 'Symbol' is
 -- tricky.  Need this view to show that when we translate some @SL.Index tps tp@
 -- to an @SL.Index sh s@, the symbol @s@ maps to the base type @tp@ (assuming
 -- that @tps ~ OperandTypes arch sh@).
@@ -315,653 +316,6 @@ data DefsInfo sym arch tps = DefsInfo
                              -- operand's name.
                              }
 
--- | Stores a NatRepr along with proof that its type parameter is a bitvector of
--- that length. Used for easy pattern matching on the LHS of a binding in a
--- do-expression to extract the proof.
-data BVProof tp where
-  BVProof :: forall n. (1 <= n) => NatRepr n -> BVProof (BaseBVType n)
-
--- | Given an expression, monadically either returns proof that it is a
--- bitvector or throws an error.
-getBVProof :: (S.IsExpr ex, E.MonadError String m) => ex tp -> m (BVProof tp)
-getBVProof expr =
-  case S.exprType expr of
-    BaseBVRepr n -> return $ BVProof n
-    t -> E.throwError $ printf "expected BV, found %s" (show t)
-
-data BoolProof tp where
-  BoolProof :: BoolProof BaseBoolType
-
-getBoolProof :: (S.IsExpr ex, E.MonadError String m) => ex tp -> m (BoolProof tp)
-getBoolProof  expr =
-  case S.exprType expr of
-    BaseBoolRepr -> return BoolProof
-    t -> E.throwError $ printf "expected a bool type, found %s" (show t)
-
--- | Type of the various different handlers for building up expressions formed
--- by applying arguments to some function.
---
--- Why is it both in 'MonadError' and return a 'Maybe'? An error is thrown if it
--- looks like a given handler should be able to handle an expression, but
--- there's some fault somewhere. 'Nothing' is returned if the handler can't
--- handle expressions looking like the form given to it.
---
--- Unrelated to the type, in many of these functions, there are statements of
--- the form @Some x <- return y@. Why do a binding from a direct return? Because
--- GHC cannot do let-destructuring when existentials are involved.
---
--- ...yes, it's a lot of type parameters.
-type ExprParser sym arch sh m = (S.IsSymExprBuilder sym,
-                                 E.MonadError String m,
-                                 MR.MonadReader (DefsInfo sym arch sh) m,
-                                 MonadIO m)
-                              => SC.SExpr FAtom
-                              -> [Some (S.SymExpr sym)]
-                              -> m (Maybe (Some (S.SymExpr sym)))
-
--- | Parse an expression of the form @(concat x y)@.
-readConcat :: ExprParser sym arch sh m
-readConcat (SC.SAtom (AIdent "concat")) args =
-  prefixError "in reading concat expression: " $ do
-    when (length args /= 2) (E.throwError $ printf "expecting 2 arguments, got %d" (length args))
-    sym <- MR.reader getSym
-    Some arg1 <- return $ args !! 0
-    Some arg2 <- return $ args !! 1
-    BVProof _ <- prefixError "in arg 1: " $ getBVProof arg1
-    BVProof _ <- prefixError "in arg 2: " $ getBVProof arg2
-    liftIO (Just . Some <$> S.bvConcat sym arg1 arg2)
-readConcat _ _ = return Nothing
-
--- | Try converting an 'Integer' to a 'NatRepr' or throw an error if not
--- possible.
-intToNatM :: (E.MonadError String m) => Integer -> m (Some NatRepr)
-intToNatM = fromMaybeError "integer must be non-negative to be a nat" . someNat
-
--- | Parse an expression of the form @((_ extract i j) x)@.
-readExtract :: ExprParser sym arch sh m
-readExtract (SC.SCons (SC.SAtom (AIdent "_"))
-             (SC.SCons (SC.SAtom (AIdent "extract"))
-              (SC.SCons (SC.SAtom (AInt iInt))
-               (SC.SCons (SC.SAtom (AInt jInt))
-                SC.SNil))))
-            args = prefixError "in reading extract expression: " $ do
-  when (length args /= 1) (E.throwError $ printf "expecting 1 argument, got %d" (length args))
-  sym <- MR.reader getSym
-  -- The SMT-LIB spec represents extracts differently than Crucible does. Per
-  -- SMT: "extraction of bits i down to j from a bitvector of size m to yield a
-  -- new bitvector of size n, where n = i - j + 1". Per Crucible:
-  --
-  -- > -- | Select a subsequence from a bitvector.
-  -- > bvSelect :: (1 <= n, idx + n <= w)
-  -- >          => sym
-  -- >          -> NatRepr idx  -- ^ Starting index, from 0 as least significant bit
-  -- >          -> NatRepr n    -- ^ Number of bits to take
-  -- >          -> SymBV sym w  -- ^ Bitvector to select from
-  -- >          -> IO (SymBV sym n)
-  --
-  -- The "starting index" seems to be from the bottom, so that (in slightly
-  -- pseudocode)
-  --
-  -- > > bvSelect sym 0 8 (0x01020304:[32])
-  -- > 0x4:[8]
-  -- > > bvSelect sym 24 8 (0x01020304:[32])
-  -- > 0x1:[8]
-  --
-  -- Thus, n = i - j + 1, and idx = j.
-  let nInt = iInt - jInt + 1
-      idxInt = jInt
-  Some nNat <- prefixError "in calculating extract length: " $ intToNatM nInt
-  Some idxNat <- prefixError "in extract lower bound: " $ intToNatM idxInt
-  LeqProof <- fromMaybeError "extract length must be positive" $ isPosNat nNat
-  Some arg <- return $ args !! 0
-  BVProof lenNat <- getBVProof arg
-  LeqProof <- fromMaybeError "invalid extract for given bitvector" $
-    testLeq (addNat idxNat nNat) lenNat
-  liftIO (Just <$> Some <$> S.bvSelect sym idxNat nNat arg)
-readExtract _ _ = return Nothing
-
--- | Parse an expression of the form @((_ zero_extend i) x)@ or @((_ sign_extend i) x)@.
-readExtend :: ExprParser sym arch sh m
-readExtend (SC.SCons (SC.SAtom (AIdent "_"))
-             (SC.SCons (SC.SAtom (AIdent extend))
-               (SC.SCons (SC.SAtom (AInt iInt))
-                SC.SNil)))
-           args
-  | extend == "zero_extend" ||
-    extend == "sign_extend" = prefixError (printf "in reading %s expression: " extend) $ do
-      when (length args /= 1) (E.throwError $ printf "expecting 1 argument, got %d" (length args))
-      sym <- MR.reader getSym
-      Some iNat <- intToNatM iInt
-      iPositive <- fromMaybeError "must extend by a positive length" $ isPosNat iNat
-      Some arg <- return $ args !! 0
-      BVProof lenNat <- getBVProof arg
-      let newLen = addNat lenNat iNat
-      liftIO $ withLeqProof (leqAdd2 (leqRefl lenNat) iPositive) $
-        let op = if extend == "zero_extend" then S.bvZext else S.bvSext
-        in Just <$> Some <$> op sym newLen arg
-readExtend _ _ = return Nothing
-
--- | Encapsulating type for a unary operation that takes one bitvector and
--- returns another (in IO).
-data BVUnop sym where
-  BVUnop :: (forall w . (1 <= w) => sym -> S.SymBV sym w -> IO (S.SymBV sym w)) -> BVUnop sym
-
--- | Look up a unary bitvector operation by name.
-bvUnop :: (S.IsExprBuilder sym) => String -> Maybe (BVUnop sym)
-bvUnop "bvneg" = Just $ BVUnop S.bvNeg
-bvUnop "bvnot" = Just $ BVUnop S.bvNotBits
-bvUnop       _ = Nothing
-
--- | Parse an expression of the form @(f x)@, where @f@ operates on bitvectors.
-readBVUnop :: forall sym arch sh m. ExprParser sym arch sh m
-readBVUnop (SC.SAtom (AIdent idnt)) args
-  | Just (BVUnop op :: BVUnop sym) <- bvUnop idnt =
-      prefixError (printf "in reading %s expression: " idnt) $ do
-        when (length args /= 1) (E.throwError $ printf "expecting 1 argument, got %d" (length args))
-        sym <- MR.reader getSym
-        Some expr <- return $ args !! 0
-        BVProof _ <- getBVProof expr
-        liftIO (Just . Some <$> op sym expr)
-readBVUnop _ _ = return Nothing
-
--- | Encapsulating type for a binary operation that takes two bitvectors of the
--- same length.
-data BVBinop sym where
-  -- | Binop with a bitvector return type, e.g., addition or bitwise operations.
-  BinopBV :: (forall w . (1 <= w) => sym -> S.SymBV sym w -> S.SymBV sym w -> IO (S.SymBV sym w)) -> BVBinop sym
-  -- | Bitvector binop with a boolean return type, i.e., comparison operators.
-  BinopBoolBV :: (forall w . (1 <= w) => sym -> S.SymBV sym w -> S.SymBV sym w -> IO (S.Pred sym)) -> BVBinop sym
-  -- A binary operator of booleans
---  BinopBool :: sym -> S.Pred sym -> S.Pred sym -> BVBinop
-
--- | Look up a binary bitvector operation by name.
-bvBinop :: (S.IsExprBuilder sym) => String -> Maybe (BVBinop sym)
-bvBinop "bvand"  = Just $ BinopBV S.bvAndBits
-bvBinop "bvor"   = Just $ BinopBV S.bvOrBits
-bvBinop "bvadd"  = Just $ BinopBV S.bvAdd
-bvBinop "bvmul"  = Just $ BinopBV S.bvMul
-bvBinop "bvudiv" = Just $ BinopBV S.bvUdiv
-bvBinop "bvurem" = Just $ BinopBV S.bvUrem
-bvBinop "bvshl"  = Just $ BinopBV S.bvShl
-bvBinop "bvlshr" = Just $ BinopBV S.bvLshr
-bvBinop "bvnand" = Just $ BinopBV $ \sym arg1 arg2 -> S.bvNotBits sym =<< S.bvAndBits sym arg1 arg2
-bvBinop "bvnor"  = Just $ BinopBV $ \sym arg1 arg2 -> S.bvNotBits sym =<< S.bvOrBits sym arg1 arg2
-bvBinop "bvxor"  = Just $ BinopBV S.bvXorBits
-bvBinop "bvxnor" = Just $ BinopBV $ \sym arg1 arg2 -> S.bvNotBits sym =<< S.bvXorBits sym arg1 arg2
-bvBinop "bvsub"  = Just $ BinopBV S.bvSub
-bvBinop "bvsdiv" = Just $ BinopBV S.bvSdiv
-bvBinop "bvsrem" = Just $ BinopBV S.bvSrem
-bvBinop "bvsmod" = error "bvsmod is not implemented"
-bvBinop "bvashr" = Just $ BinopBV S.bvAshr
-bvBinop "bvult"  = Just $ BinopBoolBV S.bvUlt
-bvBinop "bvule"  = Just $ BinopBoolBV S.bvUle
-bvBinop "bvugt"  = Just $ BinopBoolBV S.bvUgt
-bvBinop "bvuge"  = Just $ BinopBoolBV S.bvUge
-bvBinop "bvslt"  = Just $ BinopBoolBV S.bvSlt
-bvBinop "bvsle"  = Just $ BinopBoolBV S.bvSle
-bvBinop "bvsgt"  = Just $ BinopBoolBV S.bvSgt
-bvBinop "bvsge"  = Just $ BinopBoolBV S.bvSge
-bvBinop "bveq"   = Just $ BinopBoolBV S.bvEq
-bvBinop "bvne"   = Just $ BinopBoolBV S.bvNe
-bvBinop        _ = Nothing
-
-data BoolBinop sym where
-  BoolBinop :: (sym -> S.Pred sym -> S.Pred sym -> IO (S.Pred sym)) -> BoolBinop sym
-
-boolBinop :: (S.IsExprBuilder sym) => String -> Maybe (BoolBinop sym)
-boolBinop s =
-  case s of
-    "andp" -> Just $ BoolBinop S.andPred
-    "orp"  -> Just $ BoolBinop S.orPred
-    "xorp" -> Just $ BoolBinop S.xorPred
-    _ -> Nothing
-
-data BoolUnop sym where
-  BoolUnop :: (sym -> S.Pred sym -> IO (S.Pred sym)) -> BoolUnop sym
-
-boolUnop :: (S.IsExprBuilder sym) => String -> Maybe (BoolUnop sym)
-boolUnop s =
-  case s of
-    "notp" -> Just $ BoolUnop S.notPred
-    _ -> Nothing
-
--- | Parse an expression of the form @(f x y)@, where @f@ is a binary operation
--- on bitvectors.
-readBVBinop :: forall sym arch sh m. ExprParser sym arch sh m
-readBVBinop (SC.SAtom (AIdent idnt)) args
-  | Just (op :: BVBinop sym) <- bvBinop idnt =
-      prefixError (printf "in reading %s expression: " idnt) $ do
-        when (length args /= 2) (E.throwError $ printf "expecting 2 arguments, got %d" (length args))
-        sym <- MR.reader getSym
-        Some arg1 <- return $ args !! 0
-        Some arg2 <- return $ args !! 1
-        BVProof m <- prefixError "in arg 1: " $ getBVProof arg1
-        BVProof n <- prefixError "in arg 2: " $ getBVProof arg2
-        case testEquality m n of
-          Just Refl -> liftIO $ Just <$>
-            case op of
-              BinopBV op' -> Some <$> op' sym arg1 arg2
-              BinopBoolBV op' -> Some <$> op' sym arg1 arg2
-          Nothing -> E.throwError $ printf "arguments to %s must be the same length, \
-                                         \but arg 1 has length %s \
-                                         \and arg 2 has length %s"
-                                         idnt
-                                         (show m)
-                                         (show n)
-readBVBinop _ _ = return Nothing
-
-readBoolBinop :: forall sym arch sh m . ExprParser sym arch sh m
-readBoolBinop (SC.SAtom (AIdent idnt)) args
-  | Just (op :: BoolBinop sym) <- boolBinop idnt =
-      prefixError (printf "in reading %s expression: " idnt) $ do
-        when (length args /= 2) (E.throwError $ printf "expecting 2 arguments, got %d" (length args))
-        sym <- MR.reader getSym
-        Some arg1 <- return (args !! 0)
-        Some arg2 <- return (args !! 1)
-        BoolProof <- prefixError "in arg1: " $ getBoolProof arg1
-        BoolProof <- prefixError "in arg2: " $ getBoolProof arg2
-        case op of
-          BoolBinop op' -> liftIO (Just <$> Some <$> op' sym arg1 arg2)
-readBoolBinop _ _ = return Nothing
-
-readBoolUnop :: forall sym arch sh m . ExprParser sym arch sh m
-readBoolUnop (SC.SAtom (AIdent idnt)) args
-  | Just (op :: BoolUnop sym) <- boolUnop idnt =
-      prefixError (printf "in reading %s expression: " idnt) $ do
-        when (length args /= 1) (E.throwError $ printf "expecting 1 argument, got %d" (length args))
-        sym <- MR.reader getSym
-        Some arg1 <- return (args !! 0)
-        BoolProof <- prefixError "in arg1: " $ getBoolProof arg1
-        case op of
-          BoolUnop op' -> liftIO (Just <$> Some <$> op' sym arg1)
-readBoolUnop _ _ = return Nothing
-
-data Op sym where
-  Op1
-    :: Ctx.Assignment BaseTypeRepr (Ctx.EmptyCtx Ctx.::> arg1)
-    -> (sym -> S.SymExpr sym arg1 -> IO (S.SymExpr sym ret))
-    -> Op sym
-  Op2
-    :: Ctx.Assignment BaseTypeRepr (Ctx.EmptyCtx Ctx.::> arg1 Ctx.::> arg2)
-    -> (  sym
-       -> S.SymExpr sym arg1
-       -> S.SymExpr sym arg2
-       -> IO (S.SymExpr sym ret)
-       )
-    -> Op sym
-  Op3
-    :: Ctx.Assignment BaseTypeRepr (Ctx.EmptyCtx Ctx.::> arg1 Ctx.::> arg2 Ctx.::> arg3)
-    -> (  sym
-       -> S.SymExpr sym arg1
-       -> S.SymExpr sym arg2
-       -> S.SymExpr sym arg3
-       -> IO (S.SymExpr sym ret)
-       )
-    -> Op sym
-  Op4
-    :: Ctx.Assignment BaseTypeRepr (Ctx.EmptyCtx Ctx.::> arg1 Ctx.::> arg2 Ctx.::> arg3 Ctx.::> arg4)
-    -> (  sym
-       -> S.SymExpr sym arg1
-       -> S.SymExpr sym arg2
-       -> S.SymExpr sym arg3
-       -> S.SymExpr sym arg4
-       -> IO (S.SymExpr sym ret)
-       )
-    -> Op sym
-
--- | Look up a unary float operation by name.
-fpOp :: S.IsExprBuilder sym => String -> Maybe (Op sym)
-fpOp = \case
-  "fnegd" -> Just $ Op1 knownRepr $ S.floatNeg @_ @Prec64
-  "fnegs" -> Just $ Op1 knownRepr $ S.floatNeg @_ @Prec32
-  "fabsd" -> Just $ Op1 knownRepr $ S.floatAbs @_ @Prec64
-  "fabss" -> Just $ Op1 knownRepr $ S.floatAbs @_ @Prec32
-  "fsqrt" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.floatSqrt @_ @Prec64 sym rm x
-  "fsqrts" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.floatSqrt @_ @Prec32 sym rm x
-  "fnand" -> Just $ Op1 knownRepr $ S.floatIsNaN @_ @Prec64
-  "fnans" -> Just $ Op1 knownRepr $ S.floatIsNaN @_ @Prec32
-  "frsp" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.floatCast @_ @Prec32 @Prec64 sym knownRepr rm x
-  "fp_single_to_double" -> Just $ Op1 knownRepr $ \sym ->
-    S.floatCast @_ @Prec64 @Prec32 sym knownRepr S.RNE
-  "fp_binary_to_double" ->
-    Just $ Op1 knownRepr $ \sym -> S.floatFromBinary @_ @11 @53 sym knownRepr
-  "fp_binary_to_single" ->
-    Just $ Op1 knownRepr $ \sym -> S.floatFromBinary @_ @8 @24 sym knownRepr
-  "fp_double_to_binary" -> Just $ Op1 knownRepr $ S.floatToBinary @_ @11 @53
-  "fp_single_to_binary" -> Just $ Op1 knownRepr $ S.floatToBinary @_ @8 @24
-  "fctid" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.floatToSBV @_ @64 @Prec64 sym knownRepr rm x
-  "fctidu" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.floatToBV @_ @64 @Prec64 sym knownRepr rm x
-  "fctiw" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.floatToSBV @_ @32 @Prec64 sym knownRepr rm x
-  "fctiwu" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.floatToBV @_ @32 @Prec64 sym knownRepr rm x
-  "fcfid" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.sbvToFloat @_ @64 @Prec64 sym knownRepr rm x
-  "fcfids" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.sbvToFloat @_ @64 @Prec32 sym knownRepr rm x
-  "fcfidu" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.bvToFloat @_ @64 @Prec64 sym knownRepr rm x
-  "fcfidus" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.bvToFloat @_ @64 @Prec32 sym knownRepr rm x
-  "frti" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.floatRound @_ @Prec64 sym rm x
-  "frtis" -> Just $ Op2 knownRepr $ \sym r x -> U.withRounding sym r $ \rm ->
-    S.floatRound @_ @Prec32 sym rm x
-
-  "fadd" -> Just $ Op3 knownRepr $ \sym r x y -> U.withRounding sym r $ \rm ->
-    S.floatAdd @_ @Prec64 sym rm x y
-  "fadds" -> Just $ Op3 knownRepr $ \sym r x y -> U.withRounding sym r $ \rm ->
-    S.floatAdd @_ @Prec32 sym rm x y
-  "fsub" -> Just $ Op3 knownRepr $ \sym r x y -> U.withRounding sym r $ \rm ->
-    S.floatSub @_ @Prec64 sym rm x y
-  "fsubs" -> Just $ Op3 knownRepr $ \sym r x y -> U.withRounding sym r $ \rm ->
-    S.floatSub @_ @Prec32 sym rm x y
-  "fmul" -> Just $ Op3 knownRepr $ \sym r x y -> U.withRounding sym r $ \rm ->
-    S.floatMul @_ @Prec64 sym rm x y
-  "fmuls" -> Just $ Op3 knownRepr $ \sym r x y -> U.withRounding sym r $ \rm ->
-    S.floatMul @_ @Prec32 sym rm x y
-  "fdiv" -> Just $ Op3 knownRepr $ \sym r x y -> U.withRounding sym r $ \rm ->
-    S.floatDiv @_ @Prec64 sym rm x y
-  "fdivs" -> Just $ Op3 knownRepr $ \sym r x y -> U.withRounding sym r $ \rm ->
-    S.floatDiv @_ @Prec32 sym rm x y
-
-  "fltd" -> Just $ Op2 knownRepr $ S.floatLt @_ @Prec64
-  "flts" -> Just $ Op2 knownRepr $ S.floatLt @_ @Prec32
-  "feqd" -> Just $ Op2 knownRepr $ S.floatFpEq @_ @Prec64
-  "feqs" -> Just $ Op2 knownRepr $ S.floatFpEq @_ @Prec32
-  "fled" -> Just $ Op2 knownRepr $ S.floatLe @_ @Prec64
-  "fles" -> Just $ Op2 knownRepr $ S.floatLe @_ @Prec32
-
-  "ffma" -> Just $ Op4 knownRepr $ \sym r x y z -> U.withRounding sym r $ \rm ->
-    S.floatFMA @_ @Prec64 sym rm x y z
-  "ffmas" -> Just $ Op4 knownRepr $ \sym r x y z ->
-    U.withRounding sym r $ \rm -> S.floatFMA @_ @Prec32 sym rm x y z
-
-  _ -> Nothing
-
--- | Parse an expression of the form @(f x)@, where @f@ operates on floats.
-readFpOp :: forall sym arch sh m . ExprParser sym arch sh m
-readFpOp (SC.SAtom (AIdent idnt)) args
-  | Just (op :: Op sym) <- fpOp idnt
-  = prefixError (printf "in reading %s expression: " idnt) $ do
-    sym <- MR.reader getSym
-    case op of
-      Op1 arg_types fn -> do
-        exprAssignment arg_types args >>= \case
-          Ctx.Empty Ctx.:> arg1 ->
-              liftIO (Just . Some <$> fn sym arg1)
-          _ -> error "Unable to unpack Op1 arg in Formula.Parser readFpOp"
-      Op2 arg_types fn -> do
-        exprAssignment arg_types args >>= \case
-          Ctx.Empty Ctx.:> arg1 Ctx.:> arg2 ->
-              liftIO (Just . Some <$> fn sym arg1 arg2)
-          _ -> error "Unable to unpack Op2 arg in Formula.Parser readFpOp"
-      Op3 arg_types fn -> do
-        exprAssignment arg_types args >>= \case
-          Ctx.Empty Ctx.:> arg1 Ctx.:> arg2 Ctx.:> arg3 ->
-              liftIO (Just . Some <$> fn sym arg1 arg2 arg3)
-          _ -> error "Unable to unpack Op3 arg in Formula.Parser readFpOp"
-      Op4 arg_types fn -> do
-        exprAssignment arg_types args >>= \case
-          Ctx.Empty Ctx.:> arg1 Ctx.:> arg2 Ctx.:> arg3 Ctx.:> arg4 ->
-              liftIO (Just . Some <$> fn sym arg1 arg2 arg3 arg4)
-          _ -> error "Unable to unpack Op4 arg in Formula.Parser readFpOp"
-readFpOp _ _ = return Nothing
-
--- | Parse an expression of the form @(= x y)@.
-readEq :: ExprParser sym arch sh m
-readEq (SC.SAtom (AIdent "=")) args =
-  prefixError ("in reading '=' expression: ") $ do
-    when (length args /= 2) (E.throwError $ printf "expecting 2 arguments, got %d" (length args))
-    sym <- MR.reader getSym
-    Some arg1 <- return $ args !! 0
-    Some arg2 <- return $ args !! 1
-    case testEquality (S.exprType arg1) (S.exprType arg2) of
-      Just Refl -> liftIO (Just . Some <$> S.isEq sym arg1 arg2)
-      Nothing -> E.throwError $ printf "arguments must have same types, \
-                                     \but arg 1 has type %s \
-                                     \and arg 2 has type %s"
-                                     (show (S.exprType arg1))
-                                     (show (S.exprType arg2))
-readEq _ _ = return Nothing
-
--- | Parse an expression of the form @(ite b x y)@
-readIte :: ExprParser sym arch sh m
-readIte (SC.SAtom (AIdent "ite")) args =
-  prefixError ("in reading ite expression: ") $ do
-    when (length args /= 3) (E.throwError $ printf "expecting 3 arguments, got %d" (length args))
-    sym <- MR.reader getSym
-    Some test <- return $ args !! 0
-    Some then_ <- return $ args !! 1
-    Some else_ <- return $ args !! 2
-    case S.exprType test of
-      BaseBoolRepr ->
-        case testEquality (S.exprType then_) (S.exprType else_) of
-          Just Refl -> liftIO (Just . Some <$> S.baseTypeIte sym test then_ else_)
-          Nothing -> E.throwError $ printf "then and else branches must have same type, \
-                                         \but then has type %s \
-                                         \and else has type %s"
-                                         (show (S.exprType then_))
-                                         (show (S.exprType else_))
-      tp -> E.throwError $ printf "test expression must be a boolean; got %s" (show tp)
-readIte _ _ = return Nothing
-
-data ArrayJudgment :: BaseType -> BaseType -> Type where
-  ArraySingleDim :: forall idx res.
-                    BaseTypeRepr res
-                 -> ArrayJudgment idx (BaseArrayType (Ctx.SingleCtx idx) res)
-
-expectArrayWithIndex :: (E.MonadError String m) => BaseTypeRepr tp1 -> BaseTypeRepr tp2 -> m (ArrayJudgment tp1 tp2)
-expectArrayWithIndex dimRepr (BaseArrayRepr idxTpReprs resRepr) =
-  case Ctx.viewAssign idxTpReprs of
-    Ctx.AssignExtend rest idxTpRepr ->
-      case Ctx.viewAssign rest of
-        Ctx.AssignEmpty ->
-          case testEquality idxTpRepr dimRepr of
-            Just Refl -> return $ ArraySingleDim resRepr
-            Nothing -> E.throwError $ unwords ["Array index type", show idxTpRepr,
-                                             "does not match", show dimRepr]
-        _ -> E.throwError "multidimensional arrays are not supported"
-expectArrayWithIndex _ repr = E.throwError $ unwords ["expected an array, got", show repr]
-
--- | Parse an expression of the form @(select arr i)@
-readSelect :: ExprParser sym arch sh m
-readSelect (SC.SAtom (AIdent "select")) args =
-  prefixError "in reading select expression: " $ do
-    when (length args /= 2) (E.throwError $ printf "expecting 2 arguments, got %d" (length args))
-    sym <- MR.reader getSym
-    Some arr <- return $ args !! 0
-    Some idx <- return $ args !! 1
-    ArraySingleDim _ <- expectArrayWithIndex (S.exprType idx) (S.exprType arr)
-    let idx' = Ctx.empty Ctx.:> idx
-    liftIO (Just . Some <$> S.arrayLookup sym arr idx')
-readSelect _ _ = return Nothing
-
--- | Parse an expression of the form @(store arr i e)@
-readStore :: ExprParser sym arch sh m
-readStore (SC.SAtom (AIdent "store")) args =
-  prefixError "in reading store expression: " $ do
-    when (length args /= 3) (E.throwError $ printf "expecting 3 arguments, got %d" (length args))
-    sym <- MR.reader getSym
-    Some arr <- return $ args !! 0
-    Some idx <- return $ args !! 1
-    Some expr <- return $ args !! 2
-    ArraySingleDim resRepr <- expectArrayWithIndex (S.exprType idx) (S.exprType arr)
-    case testEquality resRepr (S.exprType expr) of
-      Just Refl ->
-        let idx' = Ctx.empty Ctx.:> idx
-        in liftIO (Just . Some <$> S.arrayUpdate sym arr idx' expr)
-      Nothing -> E.throwError $ printf "Array result type %s does not match %s"
-                                     (show resRepr)
-                                     (show (S.exprType expr))
-readStore _ _ = return Nothing
-
-exprAssignment' :: (E.MonadError String m,
-                    S.IsExpr ex)
-                => Ctx.Assignment BaseTypeRepr ctx
-                -> [Some ex]
-                -> m (Ctx.Assignment ex ctx)
-exprAssignment' (Ctx.viewAssign -> Ctx.AssignEmpty) [] = return Ctx.empty
-exprAssignment' (Ctx.viewAssign -> Ctx.AssignExtend restTps tp) (Some e : restExprs) = do
-  Refl <- case testEquality tp (S.exprType e) of
-            Just pf -> return pf
-            Nothing -> E.throwError ("unexpected type, assigning to: " ++ show tp ++ " from expr: " ++ show (S.exprType e))
-  restAssn <- exprAssignment' restTps restExprs
-  return $ restAssn Ctx.:> e
-exprAssignment' _ _ = E.throwError "mismatching numbers of arguments"
-
-exprAssignment :: (E.MonadError String m,
-                   S.IsExpr ex)
-               => Ctx.Assignment BaseTypeRepr ctx
-               -> [Some ex]
-               -> m (Ctx.Assignment ex ctx)
-exprAssignment tpAssn exs = exprAssignment' tpAssn (reverse exs)
-
--- | Parse an expression of the form:
---
--- > ((_ call "undefined") "bv" size)
---
--- This has to be separate from the normal uninterpreted functions because the
--- type is determined by the arguments.
-readUndefined :: forall sym arch sh m . ExprParser sym arch sh m
-readUndefined (SC.SCons (SC.SAtom (AIdent "_"))
-                (SC.SCons (SC.SAtom (AIdent "call"))
-                  (SC.SCons (SC.SAtom (AString "uf.undefined"))
-                    SC.SNil))) args =
-  case args of
-    [Some ex] ->
-      case S.exprType ex of
-        BaseBVRepr {}
-          | Just size <- S.asUnsignedBV ex -> do
-              sym <- MR.reader getSym
-              case NR.someNat @Integer (fromIntegral size) of
-                Just (Some nr) -> mkUndefined nr sym
-                Nothing -> E.throwError $ printf "Invalid size for undefined value: %d" size
-        ety -> E.throwError $ printf "Invalid expr type: %s" (show ety)
-    _ -> E.throwError $ printf "Invalid argument list for undefined"
-  where
-    mkUndefined :: forall n . NR.NatRepr n -> sym -> m (Maybe (Some (S.SymExpr sym)))
-    mkUndefined nr sym = do
-      case NR.testLeq (knownNat @1) nr of
-        Just NR.LeqProof -> do
-          let rty = BaseBVRepr nr
-          fn <- liftIO (S.freshTotalUninterpFn sym (U.makeSymbol "uf.undefined") Ctx.empty rty)
-          assn <- exprAssignment (S.fnArgTypes fn) []
-          (Just . Some) <$> liftIO (S.applySymFn sym fn assn)
-        Nothing -> E.throwError $ printf "Invalid size for undefined value: %d" (NR.widthVal nr)
-readUndefined _ _ = return Nothing
-
--- | Parse an expression of the form @((_ call "foo") x y ...)@
-readCall :: ExprParser sym arch sh m
-readCall (SC.SCons (SC.SAtom (AIdent "_"))
-            (SC.SCons (SC.SAtom (AIdent "call"))
-               (SC.SCons (SC.SAtom (AString fnName))
-                  SC.SNil))) args =
-  prefixError ("in reading call '" <> fnName <> "' expression: ") $ do
-    sym <- MR.reader getSym
-    fns <- MR.reader (envFunctions . getEnv)
-    SomeSome fn <- case Map.lookup fnName fns of
-      Just (fn, _) -> return fn
-      Nothing ->
-        let template = case take 3 fnName of
-              "uf." -> "uninterpreted function '%s' is not defined"
-              "df." -> "library function '%s' is not defined"
-              _     -> "unrecognized function prefix: '%s'"
-        in E.throwError $ printf template fnName
-    assn <- exprAssignment (S.fnArgTypes fn) args
-    liftIO (Just . Some <$> S.applySymFn sym fn assn)
-readCall _ _ = return Nothing
-
--- | Parse an arbitrary expression.
-readExpr :: forall sym m arch sh
-          . (S.IsSymExprBuilder sym,
-             Monad m,
-             E.MonadError String m,
-             A.Architecture arch,
-             MR.MonadReader (DefsInfo sym arch sh) m,
-             MonadIO m)
-         => SC.SExpr FAtom
-         -> m (Some (S.SymExpr sym))
-readExpr SC.SNil = E.throwError "found nil where expected an expression"
-readExpr (SC.SAtom (AInt _)) = E.throwError "found int where expected an expression; perhaps you wanted a bitvector?"
-readExpr (SC.SAtom (AString op)) = do
-  -- This is an uninterpreted function.
-  sym <- MR.reader getSym
-  case userSymbol op of
-    Right opSym -> do
-      e <- liftIO $ S.freshTotalUninterpFn sym opSym Ctx.empty (BaseStructRepr Ctx.empty)
-      f <- liftIO $ S.applySymFn sym e Ctx.empty
-      return $ Some f
-    Left _ -> E.throwError $ printf "couldn't parse string expression %s" (show op)
-readExpr (SC.SAtom (ABV len val)) = do
-  -- This is a bitvector literal.
-  sym <- MR.reader getSym
-  -- The following two patterns should never fail, given that during parsing we
-  -- can only construct BVs with positive length.
-  case someNat (toInteger len) of
-    Just (Some lenRepr) ->
-        let Just pf = isPosNat lenRepr
-        in liftIO $ withLeqProof pf (Some <$> S.bvLit sym lenRepr val)
-    Nothing -> error "SemMC.Formula.Parser.readExpr someNat failure"
-
-  -- Just (Some lenRepr) <- return $ someNat (toInteger len)
-  -- let Just pf = isPosNat lenRepr
-  -- liftIO $ withLeqProof pf (Some <$> S.bvLit sym lenRepr val)
-readExpr (SC.SAtom paramRaw) = do
-  -- This is a parameter (i.e., variable).
-  DefsInfo { getOpNameList = opNames
-           , getSym = sym
-           , getOpVarList = opVars
-           , getLitLookup = litLookup
-           } <- MR.ask
-  param <- readParameter (Proxy @arch) opNames paramRaw
-  case param of
-    Some (ParsedOperandParameter _ idx) -> return . Some . S.varExpr sym $ (opVars SL.!! idx)
-    Some (ParsedLiteralParameter lit) -> maybe (E.throwError ("not declared as input but saw unknown literal param: " ++ showF lit))
-                                   (return . Some) $ litLookup lit
-readExpr (SC.SCons opRaw argsRaw) = do
-  -- This is a function application.
-  args <- readExprs argsRaw
-  parseAttempt <- U.sequenceMaybes $ map (\f -> f opRaw args)
-    [ readConcat
-    , readExtract
-    , readExtend
-    , readBVUnop
-    , readBVBinop
-    , readBoolUnop
-    , readBoolBinop
-    , readFpOp
-    , readEq
-    , readIte
-    , readSelect
-    , readStore
-    , readUndefined
-    , readCall
-    ]
-  case parseAttempt of
-    Just expr -> return expr
-    Nothing -> E.throwError $ printf "couldn't parse expression %s [%s]" (show opRaw) (show argsRaw)
-
--- | Parse multiple expressions in a list.
-readExprs :: (S.IsSymExprBuilder sym,
-              Monad m,
-              E.MonadError String m,
-              A.Architecture arch,
-              MR.MonadReader (DefsInfo sym arch sh) m,
-              MonadIO m)
-          => SC.SExpr FAtom
-          -> m [Some (S.SymExpr sym)]
-readExprs SC.SNil = return []
-readExprs (SC.SAtom _) = E.throwError "found atom where expected a list of expressions"
-readExprs (SC.SCons e rest) = do
-  e' <- readExpr e
-  rest' <- readExprs rest
-  return $ e' : rest'
 
 -- | Parse the whole definitions expression, e.g.:
 --
@@ -980,22 +334,34 @@ readDefs :: forall sym m arch sh
          -> SC.SExpr FAtom
          -> m (MapF.MapF (Parameter arch sh) (S.SymExpr sym))
 readDefs _ SC.SNil = return MapF.empty
-readDefs shapeRepr (SC.SCons (SC.SCons (SC.SAtom p) (SC.SCons defRaw SC.SNil)) rest) = do
+readDefs shapeRepr (SC.SCons
+                    (SC.SCons
+                      (SC.SAtom p)
+                      (SC.SCons
+                       (SC.SCons (SC.SAtom (AIdent "let"))
+                        (SC.SCons bindings (SC.SCons body SC.SNil)))
+                        SC.SNil))
+                     rest) = do
   oplist <- MR.reader getOpNameList
   Some param <- mapSome (toParameter shapeRepr) <$> readParameter (Proxy @arch) oplist p
-  Some def <- readExpr defRaw
+  Some def <- WSP.readLetExpr bindings body
   Refl <- fromMaybeError ("mismatching types of parameter and expression for " ++ showF param) $
             testEquality (paramType param) (S.exprType def)
   rest' <- prefixError (", defining " <> showF def <> " ... ") $ readDefs shapeRepr rest
   return $ MapF.insert param def rest'
-readDefs shapeRepr (SC.SCons (SC.SCons (SC.SCons mUF (SC.SCons (SC.SAtom p) SC.SNil)) (SC.SCons defRaw SC.SNil)) rest)
+readDefs shapeRepr (SC.SCons (SC.SCons (SC.SCons mUF (SC.SCons (SC.SAtom p) SC.SNil))
+                              (SC.SCons
+                               (SC.SCons (SC.SAtom (AIdent "let"))
+                                (SC.SCons bindings (SC.SCons body SC.SNil)))
+                               SC.SNil))
+                     rest)
   | Just funcName <- matchUF mUF = prefixError (", processing uninterpreted function " <> show funcName <> " ... ") $ do
     oplist <- MR.reader getOpNameList
     Some param <- mapSome (toParameter shapeRepr) <$> readParameter (Proxy @arch) oplist p
     fns <- MR.reader (envFunctions . getEnv)
     case Map.lookup funcName fns of
       Just (_, Some rep) -> do
-        Some def <- readExpr defRaw
+        Some def <- WSP.readLetExpr bindings body
         Refl <- fromMaybeError ("mismatching types of parameter and expression for " ++ showF param) $
                   testEquality rep (S.exprType def)
         rest' <- readDefs shapeRepr rest
@@ -1163,9 +529,12 @@ readDefinedFunction' sym env text = do
               (SC.SCons (SC.SAtom (AIdent name)) SC.SNil))
       (SC.SCons (SC.SCons (SC.SAtom (AIdent "arguments")) (SC.SCons args SC.SNil))
        (SC.SCons (SC.SCons (SC.SAtom (AIdent "return")) (SC.SCons retType SC.SNil))
-         (SC.SCons (SC.SCons (SC.SAtom (AIdent "body")) (SC.SCons body SC.SNil))
+         (SC.SCons (SC.SCons (SC.SAtom (AIdent "body"))
+                    (SC.SCons (SC.SCons (SC.SAtom (AIdent "let"))
+                               (SC.SCons bindings (SC.SCons bodyRaw SC.SNil)))
+                      SC.SNil))
            SC.SNil)))
-      -> return (name, args, retType, body)
+      -> return (name, args, retType, bodyRaw)
     _ -> E.throwError "invalid top-level structure"
 
   -- Most of the following bindings have type annotations not because inference
@@ -1191,7 +560,7 @@ readDefinedFunction' sym env text = do
   argTypeReprs :: SL.List BaseTypeRepr sh
     <- traverseFC (\(OpData _ tpRepr) -> return tpRepr) arguments
 
-  Some body <- MR.runReaderT (readExpr bodyRaw) $
+  Some body <- MR.runReaderT (WSP.readLetExpr bindings bodyRaw) $
     DefsInfo { getSym = sym
              , getEnv = env
              , getLitLookup = const Nothing

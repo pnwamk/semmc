@@ -28,6 +28,8 @@ import qualified Data.Parameterized.TraversableFC as FC
 import           Data.Proxy ( Proxy(..) )
 import qualified Data.Set as Set
 import qualified Data.Text as T
+import qualified Control.Monad.Writer as W
+
 import           SemMC.Util ( fromJust' )
 
 import qualified Data.SCargot.Repr.Rich as SE
@@ -39,13 +41,12 @@ import qualified What4.Expr.Builder as S
 import qualified What4.Expr.WeightedSum as WSum
 import qualified What4.Interface as S
 import qualified What4.Symbol as S
+import qualified What4.Serialize.Printer as WSP
+import           What4.Serialize.SETokens
 
 import qualified SemMC.Architecture as A
 import qualified SemMC.BoundVar as BV
 import           SemMC.Formula.Formula
-import           SemMC.Formula.SETokens ( FAtom(..), printTokens'
-                                        , ident', quoted', int', string', bitvec'
-                                        )
 
 -- This file is organized top-down, i.e., from high-level to low-level.
 
@@ -75,12 +76,15 @@ convertSimpleDef :: forall arch proxy t
                  -> MapF.MapF (A.Location arch) (S.ExprBoundVar t)
                  -> MapF.Pair (A.Location arch) (S.Expr t)
                  -> SE.RichSExpr FAtom
-convertSimpleDef _ paramVars (MapF.Pair loc elt) =
-  SE.L [ convertLocation loc, convertElt paramLookup elt ]
+convertSimpleDef _ paramVars (MapF.Pair loc e) =
+  SE.L [ convertLocation loc, convertExprWithLet paramLookup e ]
   where
     tbl = Map.fromList [ (Some bv, convertLocation l) | MapF.Pair l bv <- MapF.toList paramVars ]
     paramLookup :: ParamLookup t
     paramLookup bv = Map.lookup (Some bv) tbl
+
+convertExprWithLet :: ParamLookup t -> (S.Expr t tp) -> SE.RichSExpr FAtom
+convertExprWithLet paramLookup e = fst $ W.runWriter $ WSP.convertExprWithLet paramLookup e
 
 -- | Intermediate serialization.
 sexprConvertParameterized :: (A.Architecture arch)
@@ -150,159 +154,14 @@ convertDef :: (ShowF (A.Location arch))
            -> Pair (Parameter arch sh) (S.Expr t)
            -> SE.RichSExpr FAtom
 convertDef opVars paramLookup (Pair param expr) =
-  SE.L [ convertParameter opVars param, convertElt paramLookup expr ]
+  SE.L [ convertParameter opVars param
+       , convertExprWithLet paramLookup expr ]
 
 -- NOTE: There's probably some fancy caching we can do because of the nonces in
 -- all the expressions. If the current implementation is at all slow, we can
 -- implement that. However, I'm skipping it for now, since I imagine this won't
 -- be a bottleneck.
 
-convertElt :: ParamLookup t -> S.Expr t tp -> SE.RichSExpr FAtom
-convertElt _ (S.SemiRingLiteral S.SemiRingNatRepr _ _) = error "NatElt not supported"
-convertElt _ (S.SemiRingLiteral S.SemiRingIntegerRepr _ _) = error "IntElt not supported"
-convertElt _ (S.SemiRingLiteral S.SemiRingRealRepr _ _) = error "RatElt not supported"
-convertElt _ (S.SemiRingLiteral (S.SemiRingBVRepr _ sz) val _) = SE.A (ABV (widthVal sz) val)
-convertElt _ (S.StringExpr {}) = error "StringExpr is not supported"
-convertElt _ (S.BoolExpr b _) = ident' $ if b then "true" else "false"
-convertElt paramLookup (S.AppExpr appElt) = convertAppElt paramLookup appElt
-convertElt paramLookup (S.NonceAppExpr nae) =
-  case S.nonceExprApp nae of
-    S.FnApp fn args -> convertFnApp paramLookup fn args
-    S.Forall {} -> error "Forall NonceAppExpr not supported"
-    S.Exists {} -> error "Exists NonceAppExpr not supported"
-    S.ArrayFromFn {} -> error "ArrayFromFn NonceAppExpr not supported"
-    S.MapOverArrays {} -> error "MapOverArrays NonceAppExpr not supported"
-    S.ArrayTrueOnEntries {} -> error "ArrayTrueOnEntries NonceAppExpr not supported"
-convertElt paramLookup (S.BoundVarExpr var) = fromJust' "SemMC.Formula.Printer paramLookup boundvar" $ paramLookup var
-
-convertFnApp :: ParamLookup t
-             -> S.ExprSymFn t args ret
-             -> Ctx.Assignment (S.Expr t) args
-             -> SE.RichSExpr FAtom
-convertFnApp paramLookup fn args
-  | name == "undefined"
-  , BaseBVRepr nr <- S.fnReturnType fn =
-      let call = SE.L [ ident' "_", ident' "call", quoted' "uf.undefined" ]
-      in SE.L [ call, int' (NR.intValue nr) ]
-  | otherwise =
-    let call = SE.L [ ident' "_", ident' "call", quoted' (prefix ++ T.unpack name) ]
-    in SE.L (call : FC.toListFC (convertElt paramLookup) args)
-  where
-    name = S.solverSymbolAsText (S.symFnName fn)
-    prefix = case S.symFnInfo fn of
-      S.UninterpFnInfo _ _ -> "uf."
-      S.DefinedFnInfo _ _ _ -> "df."
-      _ -> error ("Unsupported function: " ++ T.unpack name)
-
-convertAppElt :: ParamLookup t -> S.AppExpr t tp -> SE.RichSExpr FAtom
-convertAppElt paramLookup = convertApp paramLookup . S.appExprApp
-
-convertApp :: forall t tp. ParamLookup t -> S.App (S.Expr t) tp -> SE.RichSExpr FAtom
-convertApp paramLookup = convertApp'
-  where convert :: forall tp'. S.Expr t tp' -> SE.RichSExpr FAtom
-        convert = convertElt paramLookup
-
-        convertApp' :: S.App (S.Expr t) tp -> SE.RichSExpr FAtom
-
-        convertApp' (S.BaseIte _bt _ c xe ye) = SE.L [ident' "ite", convert c, convert xe, convert ye]
-        convertApp' (S.BaseEq _bt v1 v2) = SE.L [ident' "=", convert v1, convert v2]
-        convertApp' (S.NotPred x) = SE.L [ident' "notp", convert x]
-        convertApp' (S.ConjPred bm) = convertBoolMap "andp" True bm
-        convertApp' (S.DisjPred bm) = convertBoolMap "orp" False bm
-
-        convertApp' (S.BVSlt bv1 bv2) = SE.L [ident' "bvslt", convert bv1, convert bv2]
-        convertApp' (S.BVUlt bv1 bv2) = SE.L [ident' "bvult", convert bv1, convert bv2]
-        convertApp' (S.BVConcat _ bv1 bv2) = SE.L [ident' "concat", convert bv1, convert bv2]
-        convertApp' (S.BVSelect idx n bv) = extract i j bv
-          -- See SemMC.Formula.Parser.readExtract for the explanation behind
-          -- these values.
-          where i = intValue n + j - 1
-                j = intValue idx
-
-        -- Note that because the SemiRing has an identity element that
-        -- always gets applied, resulting in lots of additional,
-        -- unnecessary elements like: "(bvand #xffffffff TERM)".
-        -- These will get manifested in the stored form (but generally
-        -- _not_ via DSL-generated versions since they don't output
-        -- via Printer) and result in longer stored forms.  They could
-        -- be eliminated by checking for the identity (e.g. "if mul ==
-        -- SR.one (WSum.sumRepr sm)") but the re-loaded representation
-        -- will still use the SemiRing, so it's probably not worth the
-        -- effort to reduce these.
-        convertApp' (S.SemiRingSum sm) =
-          case WSum.sumRepr sm of
-            S.SemiRingBVRepr S.BVArithRepr w ->
-              let smul mul e = SE.L [ ident' "bvmul", bitvec' (natValue w) mul, convert e ]
-                  sval v = bitvec' (natValue w) v
-                  add x y = SE.L [ ident' "bvadd", x, y ]
-              in WSum.eval add smul sval sm
-            S.SemiRingBVRepr S.BVBitsRepr w ->
-              let smul mul e = SE.L [ ident' "bvand", bitvec' (natValue w) mul, convert e ]
-                  sval v = bitvec' (natValue w) v
-                  add x y = let op = ident' "bvxor" in SE.L [ op, x, y ]
-              in WSum.eval add smul sval sm
-            S.SemiRingNatRepr     -> error "SemiRingSum NatRepr not supported"
-            S.SemiRingIntegerRepr -> error "SemiRingSum IntRepr not supported"
-            S.SemiRingRealRepr    -> error "SemiRingSum RealRepr not supported"
-
-        convertApp' (S.SemiRingProd pd) =
-          case WSum.prodRepr pd of
-            S.SemiRingBVRepr S.BVArithRepr w ->
-              let pmul x y = SE.L [ ident' "bvmul", x, y ]
-                  unit = bitvec' (natValue w) 1
-              in maybe unit id $ WSum.prodEval pmul convert pd
-            S.SemiRingBVRepr S.BVBitsRepr w ->
-              let pmul x y = SE.L [ ident' "bvand", x, y ]
-                  unit = bitvec' (natValue w) $ maxUnsigned w
-              in maybe unit id $ WSum.prodEval pmul convert pd
-            S.SemiRingNatRepr     -> error "convertApp' S.SemiRingProd Nat unsupported"
-            S.SemiRingIntegerRepr -> error "convertApp' S.SemiRingProd Integer unsupported"
-            S.SemiRingRealRepr    -> error "convertApp' S.SemiRingProd Real unsupported"
-
-        convertApp' (S.BVOrBits pd) =
-          case WSum.prodRepr pd of
-            S.SemiRingBVRepr _ w ->
-              let pmul x y = SE.L [ident' "bvor", x, y ]
-                  unit = bitvec' (natValue w) 0
-              in maybe unit id $ WSum.prodEval pmul convert pd
-
-        convertApp' (S.BVUdiv _ bv1 bv2) = SE.L [ident' "bvudiv", convert bv1, convert bv2]
-        convertApp' (S.BVUrem _ bv1 bv2) = SE.L [ident' "bvurem", convert bv1, convert bv2]
-        convertApp' (S.BVSdiv _ bv1 bv2) = SE.L [ident' "bvsdiv", convert bv1, convert bv2]
-        convertApp' (S.BVSrem _ bv1 bv2) = SE.L [ident' "bvsrem", convert bv1, convert bv2]
-        convertApp' (S.BVShl _ bv1 bv2) = SE.L [ident' "bvshl", convert bv1, convert bv2]
-        convertApp' (S.BVLshr _ bv1 bv2) = SE.L [ident' "bvlshr", convert bv1, convert bv2]
-        convertApp' (S.BVAshr _ bv1 bv2) = SE.L [ident' "bvashr", convert bv1, convert bv2]
-        convertApp' (S.BVZext r bv) = extend "zero" (intValue r) bv
-        convertApp' (S.BVSext r bv) = extend "sign" (intValue r) bv
-
-        convertApp' app = error $ "unhandled App: " ++ show app
-
-        convertBoolMap op base bm =
-          let strBase b = if b
-                          then SE.L [ident' "=", bitvec' 1 0, bitvec' 1 0]  -- true
-                          else SE.L [ident' "=", bitvec' 1 0, bitvec' 1 1]  -- false
-              strNotBase = strBase . not
-          in case BooM.viewBoolMap bm of
-               BooM.BoolMapUnit -> strBase base
-               BooM.BoolMapDualUnit -> strNotBase base
-               BooM.BoolMapTerms ts ->
-                 let onEach e r = SE.L [ident' op, arg e, r]
-                     arg (t, BooM.Positive) = convert t
-                     arg (t, BooM.Negative) = SE.L [ident' "notp", convert t]
-                 in F.foldr onEach (strBase base) ts
-
-        extract :: forall tp'. Integer -> Integer -> S.Expr t tp' -> SE.RichSExpr FAtom
-        extract i j bv = SE.L [ SE.L [ ident' "_", ident' "extract", int' i, int' j ]
-                              , convert bv
-                              ]
-
-        extend :: forall w. String -> Integer -> S.Expr t (BaseBVType w) -> SE.RichSExpr FAtom
-        extend op r bv = SE.L [ SE.L [ ident' "_", ident' $ op <> "_extend", int' extension ]
-                              , convert bv
-                              ]
-          where extension = r - w
-                w = case S.exprType bv of BaseBVRepr len -> intValue len
 
 -- | Extract the name, as a String, of a wrapped bound variable.
 varName :: BV.BoundVar (S.ExprBuilder t st fs) arch op -> String
