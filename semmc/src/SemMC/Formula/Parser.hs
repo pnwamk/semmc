@@ -344,7 +344,7 @@ readDefs shapeRepr (SC.SCons
                      rest) = do
   oplist <- MR.reader getOpNameList
   Some param <- mapSome (toParameter shapeRepr) <$> readParameter (Proxy @arch) oplist p
-  Some def <- WSP.readLetExpr bindings body
+  Some def <- WSP.readLetExpr @sym bindings body
   Refl <- fromMaybeError ("mismatching types of parameter and expression for " ++ showF param) $
             testEquality (paramType param) (S.exprType def)
   rest' <- prefixError (", defining " <> showF def <> " ... ") $ readDefs shapeRepr rest
@@ -361,7 +361,7 @@ readDefs shapeRepr (SC.SCons (SC.SCons (SC.SCons mUF (SC.SCons (SC.SAtom p) SC.S
     fns <- MR.reader (envFunctions . getEnv)
     case Map.lookup funcName fns of
       Just (_, Some rep) -> do
-        Some def <- WSP.readLetExpr bindings body
+        Some def <- WSP.readLetExpr @sym bindings body
         Refl <- fromMaybeError ("mismatching types of parameter and expression for " ++ showF param) $
                   testEquality rep (S.exprType def)
         rest' <- readDefs shapeRepr rest
@@ -524,17 +524,17 @@ readDefinedFunction' sym env text = do
   liftIO $ U.logIO U.Info $
     "readDefinedFunction' of " ++ (show $ T.length text) ++ " bytes " ++ firstLine
   -- Extract the raw s-expressions for the four components.
-  (name, argsRaw, retTypeRaw, bodyRaw) <- case sexpr of
+  (name, argsRaw, retTypeRaw, bindingsRaw, bodyRaw) <- case sexpr of
     SC.SCons (SC.SCons (SC.SAtom (AIdent "function"))
               (SC.SCons (SC.SAtom (AIdent name)) SC.SNil))
       (SC.SCons (SC.SCons (SC.SAtom (AIdent "arguments")) (SC.SCons args SC.SNil))
        (SC.SCons (SC.SCons (SC.SAtom (AIdent "return")) (SC.SCons retType SC.SNil))
          (SC.SCons (SC.SCons (SC.SAtom (AIdent "body"))
                     (SC.SCons (SC.SCons (SC.SAtom (AIdent "let"))
-                               (SC.SCons bindings (SC.SCons bodyRaw SC.SNil)))
+                               (SC.SCons bindingsRaw (SC.SCons bodyRaw SC.SNil)))
                       SC.SNil))
            SC.SNil)))
-      -> return (name, args, retType, bodyRaw)
+      -> return (name, args, retType, bindingsRaw, bodyRaw)
     _ -> E.throwError "invalid top-level structure"
 
   -- Most of the following bindings have type annotations not because inference
@@ -560,7 +560,7 @@ readDefinedFunction' sym env text = do
   argTypeReprs :: SL.List BaseTypeRepr sh
     <- traverseFC (\(OpData _ tpRepr) -> return tpRepr) arguments
 
-  Some body <- MR.runReaderT (WSP.readLetExpr bindings bodyRaw) $
+  Some body <- MR.runReaderT (WSP.readLetExpr @sym bindingsRaw bodyRaw) $
     DefsInfo { getSym = sym
              , getEnv = env
              , getLitLookup = const Nothing
