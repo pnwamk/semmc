@@ -73,10 +73,10 @@ type OperandTypes arch sh = TL.Map (OperandTypeWrapper arch) sh
 -- | A counterpart to 'SemMC.Formula.Parameter' for use in the parser, where we
 -- might know only a parameter's base type (such as when parsing a defined
 -- function).
-data ParsedParameter arch (tps :: [BaseType]) (tp :: BaseType) where
+data ParsedParameter (lit :: BaseType -> Type) (tps :: [BaseType]) (tp :: BaseType) where
   ParsedOperandParameter :: BaseTypeRepr tp -> SL.Index tps tp
-                         -> ParsedParameter arch tps tp
-  ParsedLiteralParameter :: L.Location arch tp -> ParsedParameter arch tps tp
+                         -> ParsedParameter lit tps tp
+  ParsedLiteralParameter :: lit tp -> ParsedParameter lit tps tp
 
 -- Translating from 'SL.Index' on 'BaseType' to 'SL.Index' on 'Symbol' is
 -- tricky.  Need this view to show that when we translate some @SL.Index tps tp@
@@ -98,7 +98,7 @@ indexByArchType p (_ SL.:< shapeRepr) (SL.IndexThere ix) =
 
 toParameter :: forall arch sh tp
              . A.ShapeRepr arch sh
-            -> ParsedParameter arch (OperandTypes arch sh) tp
+            -> ParsedParameter (A.Location arch) (OperandTypes arch sh) tp
             -> Parameter arch sh tp
 toParameter shapeRepr (ParsedOperandParameter tpRepr ix) =
   case indexByArchType (Proxy @arch) shapeRepr ix of
@@ -269,8 +269,12 @@ findOpListIndex x ((OpData name tpRepr) SL.:< rest)
       where incrIndex (IndexWithType tpRepr' idx) = IndexWithType tpRepr' (SL.IndexThere idx)
 
 -- | Parse a single parameter, given the list of operands to use as a lookup.
-readParameter :: (E.MonadError String m, A.Architecture arch) => proxy arch -> SL.List OpData tps -> FAtom -> m (Some (ParsedParameter arch tps))
-readParameter _ oplist atom =
+readParameter ::
+  (L.IsLocation loc, E.MonadError String m)
+  => SL.List OpData tps
+  -> FAtom
+  -> m (Some (ParsedParameter loc tps))
+readParameter oplist atom =
   readRawParameter atom >>= \case
     RawOperand op ->
       maybe (E.throwError $ printf "couldn't find operand %s" op)
@@ -282,15 +286,14 @@ readParameter _ oplist atom =
             (A.readLocation lit)
 
 -- | Parses the input list, e.g., @(ra rb 'ca)@
-readInputs :: forall m (arch :: Type) (tps :: [BaseType])
-            . (E.MonadError String m,
-               A.Architecture arch)
+readInputs :: forall m (loc :: BaseType -> Type) (tps :: [BaseType])
+            . (L.IsLocation loc, E.MonadError String m)
            => SL.List OpData tps
            -> SC.SExpr FAtom
-           -> m [Some (ParsedParameter arch tps)]
+           -> m [Some (ParsedParameter loc tps)]
 readInputs _ SC.SNil = return []
 readInputs oplist (SC.SCons (SC.SAtom p) rest) = do
-  p' <- readParameter Proxy oplist p
+  p' <- readParameter oplist p
   rest' <- readInputs oplist rest
   return $ p' : rest'
 readInputs _ i = E.throwError $ "malformed input list: " <> show i
@@ -298,25 +301,26 @@ readInputs _ i = E.throwError $ "malformed input list: " <> show i
 -- ** Parsing definitions
 
 -- | "Global" data stored in the Reader monad throughout parsing the definitions.
-data DefsInfo sym arch tps = DefsInfo
-                             { getSym :: sym
-                             -- ^ SymInterface/ExprBuilder used to build up symbolic
-                             -- expressions while parsing the definitions.
-                             , getEnv :: FormulaEnv sym arch
-                             -- ^ Global formula environment
-                             , getLitLookup :: forall tp. A.Location arch tp -> Maybe (S.SymExpr sym tp)
-                             -- ^ Function used to retrieve the expression
-                             -- corresponding to a given literal.
-                             , getOpVarList :: SL.List (S.BoundVar sym) tps
-                             -- ^ ShapedList used to retrieve the variable
-                             -- corresponding to a given literal.
-                             , getOpNameList :: SL.List OpData tps
-                             -- ^ ShapedList used to look up the index given an
-                             -- operand's name.
-                             , getBindings :: Map.Map FAtom (Some (S.SymExpr sym))
-                             -- ^ Mapping of currently in-scope let-bound variables
-                             --- to their parsed bindings.
-                             }
+
+data DefsInfo sym tps =
+  DefsInfo
+  { getSym :: sym
+    -- ^ SymInterface/ExprBuilder used to build up symbolic
+    -- expressions while parsing the definitions.
+  , getEnv :: FormulaEnv sym
+    -- ^ Global formula environment
+  , getQuotedLookup :: String -> Maybe (Some (S.SymExpr sym))
+  , getOpVarList :: SL.List (S.BoundVar sym) tps
+    -- ^ ShapedList used to retrieve the variable
+    -- corresponding to a given literal.
+  , getOpNameList :: SL.List OpData tps
+    -- ^ ShapedList used to look up the index given an
+    -- operand's name.
+  , getBindings :: Map.Map String (Some (S.SymExpr sym))
+    -- ^ Mapping of currently in-scope let-bound variables
+    --- to their parsed bindings.
+  }
+
 
 -- | Stores a NatRepr along with proof that its type parameter is a bitvector of
 -- that length. Used for easy pattern matching on the LHS of a binding in a
@@ -514,8 +518,7 @@ lookupOp = \case
 readOneArg ::
   (S.IsSymExprBuilder sym,
     E.MonadError String m,
-    MR.MonadReader (DefsInfo sym arch sh) m,
-    A.Architecture arch,
+    MR.MonadReader (DefsInfo sym sh) m,
     MonadIO m)
   => SC.SExpr FAtom
   -> m (Some (S.SymExpr sym))
@@ -530,8 +533,7 @@ readOneArg operands = do
 readTwoArgs ::
   (S.IsSymExprBuilder sym,
     E.MonadError String m,
-    MR.MonadReader (DefsInfo sym arch sh) m,
-    A.Architecture arch,
+    MR.MonadReader (DefsInfo sym sh) m,
     MonadIO m)
   => SC.SExpr FAtom
   -> m (Some (S.SymExpr sym), Some (S.SymExpr sym))
@@ -546,8 +548,7 @@ readTwoArgs operands = do
 readThreeArgs ::
   (S.IsSymExprBuilder sym,
     E.MonadError String m,
-    MR.MonadReader (DefsInfo sym arch sh) m,
-    A.Architecture arch,
+    MR.MonadReader (DefsInfo sym sh) m,
     MonadIO m)
   => SC.SExpr FAtom
   -> m (Some (S.SymExpr sym), Some (S.SymExpr sym), Some (S.SymExpr sym))
@@ -560,11 +561,10 @@ readThreeArgs operands = do
 
 -- | Reads an "application" form, i.e. @(operator operands ...)@.
 readApp ::
-  forall sym m arch sh .
+  forall sym m sh .
   (S.IsSymExprBuilder sym,
     E.MonadError String m,
-    MR.MonadReader (DefsInfo sym arch sh) m,
-    A.Architecture arch,
+    MR.MonadReader (DefsInfo sym sh) m,
     MonadIO m)
   => SC.SExpr FAtom
   -> SC.SExpr FAtom
@@ -888,12 +888,11 @@ exprAssignment tpAssn exs = exprAssignment' tpAssn (reverse exs) 0 (Ctx.sizeInt 
 -- let, parse the bindings into the Reader monad's state and
 -- then parse the body with those newly bound variables.
 readLetExpr ::
-  forall sym m arch sh
+  forall sym m sh
   . (S.IsSymExprBuilder sym,
       Monad m,
       E.MonadError String m,
-      A.Architecture arch,
-      MR.MonadReader (DefsInfo sym arch sh) m,
+      MR.MonadReader (DefsInfo sym sh) m,
       MonadIO m)
   => SC.SExpr FAtom
   -- ^ Bindings in a let-expression.
@@ -901,7 +900,7 @@ readLetExpr ::
   -- ^ Body of the let-expression.
   -> m (Some (S.SymExpr sym))
 readLetExpr SC.SNil body = readExpr body
-readLetExpr (SC.SCons (SC.SCons (SC.SAtom x@(AIdent _)) (SC.SCons e SC.SNil)) rst) body = do
+readLetExpr (SC.SCons (SC.SCons (SC.SAtom (AIdent x)) (SC.SCons e SC.SNil)) rst) body = do
   v <- readExpr e
   MR.local (\r -> r {getBindings = (Map.insert x v) $ getBindings r}) $
     readLetExpr rst body
@@ -910,12 +909,11 @@ readLetExpr bindings _body = E.throwError $
 
 
 -- | Parse an arbitrary expression.
-readExpr :: forall sym m arch sh
+readExpr :: forall sym m sh
           . (S.IsSymExprBuilder sym,
              Monad m,
              E.MonadError String m,
-             A.Architecture arch,
-             MR.MonadReader (DefsInfo sym arch sh) m,
+             MR.MonadReader (DefsInfo sym sh) m,
              MonadIO m)
          => SC.SExpr FAtom
          -> m (Some (S.SymExpr sym))
@@ -951,39 +949,67 @@ readExpr (SC.SAtom (ABV len val)) = do
   -- Just (Some lenRepr) <- return $ someNat (toInteger len)
   -- let Just pf = isPosNat lenRepr
   -- liftIO $ withLeqProof pf (Some <$> S.bvLit sym lenRepr val)
-readExpr (SC.SAtom paramRaw) = do
-  maybeBinding <- MR.asks $ (Map.lookup paramRaw) . getBindings
+readExpr (SC.SAtom (AIdent name)) = do
+  maybeBinding <- MR.asks $ (Map.lookup name) . getBindings
   case maybeBinding of
     -- if this is actually a let-bound variable, simply return it's binding
     Just binding -> return binding
-    Nothing -> do
-      -- Otherwise this is a standard parameter (i.e., variable).
-      DefsInfo { getOpNameList = opNames
-               , getSym = sym
-               , getOpVarList = opVars
-               , getLitLookup = litLookup
-               } <- MR.ask
-      param <- readParameter (Proxy @arch) opNames paramRaw
-      case param of
-        Some (ParsedOperandParameter _ idx) ->
-          return . Some . S.varExpr sym $ (opVars SL.!! idx)
-        Some (ParsedLiteralParameter lit) ->
-          maybe (E.throwError ("not declared as input but saw unknown literal param: " ++ showF lit))
-                                   (return . Some) $ litLookup lit
+    Nothing -> globalLookupIdent name
+readExpr (SC.SAtom (AQuoted qname)) = globalLookupQuoted qname
 readExpr (SC.SCons (SC.SAtom (AIdent "let")) rhs) =
   case rhs of
     (SC.SCons bindings (SC.SCons body SC.SNil)) -> readLetExpr bindings body
     _ -> E.throwError "ill-formed let s-expression"
-readExpr (SC.SCons operator operands) = do
-  readApp operator operands
+readExpr (SC.SAtom a@(ANamed _ _ _)) = E.throwError $ "unknown named atom: " ++ show a
+readExpr (SC.SCons operator operands) = readApp operator operands
+
+
+globalLookupQuoted ::
+  forall sym sh m .
+  (S.IsSymExprBuilder sym,
+   Monad m,
+   E.MonadError String m,
+   MR.MonadReader (DefsInfo sym sh) m,
+   MonadIO m)
+  => String
+  -> m (Some (S.SymExpr sym))
+globalLookupQuoted qname = do
+  dinfo <- MR.ask
+  case userSymbol (literalVarPrefix ++ qname) of
+    Right _ ->
+      case (getQuotedLookup dinfo) qname of
+        Just e -> return e
+        Nothing -> E.throwError $ "unknown quoted value in s-expression: " ++ qname
+    Left _ -> E.throwError $ printf "%s is not a quoted name" qname
+
+globalLookupIdent ::
+  forall sym sh m .
+  (S.IsSymExprBuilder sym,
+   Monad m,
+   E.MonadError String m,
+   MR.MonadReader (DefsInfo sym sh) m,
+   MonadIO m)
+  => String
+  -> m (Some (S.SymExpr sym))
+globalLookupIdent name = do
+  DefsInfo { getOpNameList = opNames
+           , getSym = sym
+           , getOpVarList = opVars
+           } <- MR.ask
+  case userSymbol (operandVarPrefix ++ name) of
+    Right _ ->
+      case (findOpListIndex name opNames) of
+        Just (Some (IndexWithType _ idx)) ->
+          return . Some . S.varExpr sym $ (opVars SL.!! idx)
+        Nothing -> E.throwError $ printf "couldn't find operand %s" name
+    Left _ -> E.throwError $ printf "%s is not a valid parameter name" name
 
 
 -- | Parse multiple expressions in a list.
 readExprs :: (S.IsSymExprBuilder sym,
               Monad m,
               E.MonadError String m,
-              A.Architecture arch,
-              MR.MonadReader (DefsInfo sym arch sh) m,
+              MR.MonadReader (DefsInfo sym sh) m,
               MonadIO m)
           => SC.SExpr FAtom
           -> m [Some (S.SymExpr sym)]
@@ -995,12 +1021,11 @@ readExprs (SC.SCons e rest) = do
   return $ e' : rest'
 
 readExprsAsAssignment ::
-  forall sym m arch sh .
+  forall sym m sh .
   (S.IsSymExprBuilder sym,
     Monad m,
     E.MonadError String m,
-    A.Architecture arch,
-    MR.MonadReader (DefsInfo sym arch sh) m,
+    MR.MonadReader (DefsInfo sym sh) m,
     MonadIO m)
   => SC.SExpr FAtom
   -> m (Some (Ctx.Assignment (S.SymExpr sym)))
@@ -1017,12 +1042,12 @@ readExprsAsAssignment sexpr = E.throwError $ "expected list of expressions: " ++
 -- > ((rt . (bvadd ra rb))
 -- >  ('ca . #b1))
 --
-readDefs :: forall sym m arch sh
+readDefs :: forall arch sym m sh
           . (S.IsSymExprBuilder sym,
              Monad m,
              E.MonadError String m,
              A.Architecture arch,
-             MR.MonadReader (DefsInfo sym arch (OperandTypes arch sh)) m,
+             MR.MonadReader (DefsInfo sym (OperandTypes arch sh)) m,
              MonadIO m,
              ShowF (S.SymExpr sym))
          => A.ShapeRepr arch sh
@@ -1031,7 +1056,7 @@ readDefs :: forall sym m arch sh
 readDefs _ SC.SNil = return MapF.empty
 readDefs shapeRepr (SC.SCons (SC.SCons (SC.SAtom p) (SC.SCons defRaw SC.SNil)) rest) = do
   oplist <- MR.reader getOpNameList
-  Some param <- mapSome (toParameter shapeRepr) <$> readParameter (Proxy @arch) oplist p
+  Some param <- mapSome (toParameter @arch shapeRepr) <$> readParameter oplist p
   Some def <- readExpr defRaw
   Refl <- fromMaybeError ("mismatching types of parameter and expression for " ++ showF param) $
             testEquality (paramType param) (S.exprType def)
@@ -1040,14 +1065,14 @@ readDefs shapeRepr (SC.SCons (SC.SCons (SC.SAtom p) (SC.SCons defRaw SC.SNil)) r
 readDefs shapeRepr (SC.SCons (SC.SCons (SC.SCons mUF (SC.SCons (SC.SAtom p) SC.SNil)) (SC.SCons defRaw SC.SNil)) rest)
   | Just funcName <- matchUF mUF = prefixError (", processing uninterpreted function " <> show funcName <> " ... ") $ do
     oplist <- MR.reader getOpNameList
-    Some param <- mapSome (toParameter shapeRepr) <$> readParameter (Proxy @arch) oplist p
+    Some param <- mapSome (toParameter @arch shapeRepr) <$> readParameter oplist p
     fns <- MR.reader (envFunctions . getEnv)
     case Map.lookup funcName fns of
       Just (_, Some rep) -> do
         Some def <- readExpr defRaw
         Refl <- fromMaybeError ("mismatching types of parameter and expression for " ++ showF param) $
                   testEquality rep (S.exprType def)
-        rest' <- readDefs shapeRepr rest
+        rest' <- readDefs @arch shapeRepr rest
         case param of
           LiteralParameter {} -> E.throwError "Literals are not allowed as arguments to parameter functions"
           FunctionParameter {} -> E.throwError "Nested parameter functions are not allowed"
@@ -1075,7 +1100,7 @@ readFormula' :: forall sym arch (sh :: [Symbol]) m.
                  ShowF (S.SymExpr sym),
                  U.HasLogCfg)
              => sym
-             -> FormulaEnv sym arch
+             -> FormulaEnv sym
              -> A.ShapeRepr arch sh
              -> T.Text
              -> m (ParameterizedFormula sym arch sh)
@@ -1107,8 +1132,8 @@ readFormula' sym env repr text = do
                     ") from " ++ show opsRaw) $
        buildOperandList' (Proxy @arch) repr opsRaw
 
-  inputs :: [Some (ParsedParameter arch (OperandTypes arch sh))]
-    <- readInputs @m @arch @(OperandTypes arch sh) operands inputsRaw
+  inputs :: [Some (ParsedParameter (A.Location arch) (OperandTypes arch sh))]
+    <- readInputs @m @(A.Location arch) @(OperandTypes arch sh) operands inputsRaw
 
   let mkOperandVar :: forall tp. OpData tp -> m (S.BoundVar sym tp)
       mkOperandVar (OpData name tpRepr) =
@@ -1128,7 +1153,7 @@ readFormula' sym env repr text = do
         let symbol = U.makeSymbol (literalVarPrefix ++ showF loc)
         in liftIO $ S.freshBoundVar sym symbol tpRepr
 
-      buildLitVarMap :: Some (ParsedParameter arch (OperandTypes arch sh))
+      buildLitVarMap :: Some (ParsedParameter (A.Location arch) (OperandTypes arch sh))
                      -> MapF.MapF (A.Location arch) (S.BoundVar sym)
                      -> m (MapF.MapF (A.Location arch) (S.BoundVar sym))
       buildLitVarMap (Some (ParsedLiteralParameter loc)) m = (\v -> MapF.insert loc v m) <$> mkLiteralVar (A.locationType loc) loc
@@ -1136,14 +1161,17 @@ readFormula' sym env repr text = do
 
   litVars :: MapF.MapF (A.Location arch) (S.BoundVar sym)
     <- foldrM buildLitVarMap MapF.empty inputs
-
+    
   defs <- MR.runReaderT (readDefs repr defsRaw) $
             (DefsInfo { getSym = sym
                       , getEnv = env
-                      , getLitLookup = \loc -> S.varExpr sym <$> flip MapF.lookup litVars loc
                       , getOpVarList = opVarList
                       , getOpNameList = operands
                       , getBindings = Map.empty
+                      , getQuotedLookup = \qname -> do
+                          (Some l) <- A.readLocation qname
+                          v <- flip MapF.lookup litVars l
+                          return $ Some $ S.varExpr sym v
                       })
 
   let finalInputs :: [Some (Parameter arch sh)]
@@ -1166,7 +1194,7 @@ readFormula :: (S.IsSymExprBuilder sym,
                 ShowF (S.SymExpr sym),
                 U.HasLogCfg)
             => sym
-            -> FormulaEnv sym arch
+            -> FormulaEnv sym
             -> A.ShapeRepr arch sh
             -> T.Text
             -> IO (Either String (ParameterizedFormula sym arch sh))
@@ -1178,7 +1206,7 @@ readFormulaFromFile :: (S.IsSymExprBuilder sym,
                         ShowF (S.SymExpr sym),
                         U.HasLogCfg)
                     => sym
-                    -> FormulaEnv sym arch
+                    -> FormulaEnv sym
                     -> A.ShapeRepr arch sh
                     -> FilePath
                     -> IO (Either String (ParameterizedFormula sym arch sh))
@@ -1188,16 +1216,15 @@ readFormulaFromFile sym env repr fp = do
 
 -- | Parse the whole definition of a defined function, inside an appropriate
 -- monad.
-readDefinedFunction' :: forall sym arch m.
+readDefinedFunction' :: forall sym m.
                         (S.IsExprBuilder sym,
                          S.IsSymInterface sym,
                          E.MonadError String m,
                          MonadIO m,
-                         A.Architecture arch,
                          ShowF (S.SymExpr sym),
                          U.HasLogCfg)
                      => sym
-                     -> FormulaEnv sym arch
+                     -> FormulaEnv sym
                      -> T.Text
                      -> m (Some (FunctionFormula sym))
 readDefinedFunction' sym env text = do
@@ -1244,10 +1271,10 @@ readDefinedFunction' sym env text = do
   Some body <- MR.runReaderT (readExpr bodyRaw) $
     DefsInfo { getSym = sym
              , getEnv = env
-             , getLitLookup = const Nothing
              , getOpVarList = argVarList
              , getOpNameList = arguments
              , getBindings = Map.empty
+             , getQuotedLookup = const Nothing
              }
 
   let actualTypeRepr = S.exprType body
@@ -1271,11 +1298,10 @@ readDefinedFunction' sym env text = do
 -- | Parse the definition of a templated formula.
 readDefinedFunction :: (S.IsExprBuilder sym,
                         S.IsSymInterface sym,
-                        A.Architecture arch,
                         ShowF (S.SymExpr sym),
                         U.HasLogCfg)
                     => sym
-                    -> FormulaEnv sym arch
+                    -> FormulaEnv sym
                     -> T.Text
                     -> IO (Either String (Some (FunctionFormula sym)))
 readDefinedFunction sym env text = E.runExceptT $ readDefinedFunction' sym env text
@@ -1283,11 +1309,10 @@ readDefinedFunction sym env text = E.runExceptT $ readDefinedFunction' sym env t
 -- | Read a defined function definition from a file, then parse it.
 readDefinedFunctionFromFile :: (S.IsExprBuilder sym,
                                 S.IsSymInterface sym,
-                                A.Architecture arch,
                                 ShowF (S.SymExpr sym),
                                 U.HasLogCfg)
                     => sym
-                    -> FormulaEnv sym arch
+                    -> FormulaEnv sym
                     -> FilePath
                     -> IO (Either String (Some (FunctionFormula sym)))
 readDefinedFunctionFromFile sym env fp = do

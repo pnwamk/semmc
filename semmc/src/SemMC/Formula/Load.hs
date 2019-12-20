@@ -46,7 +46,7 @@ formulaEnv :: forall sym arch
             . (A.Architecture arch, CRU.IsSymExprBuilder sym)
            => Proxy arch
            -> sym
-           -> IO (FE.FormulaEnv sym arch)
+           -> IO (FE.FormulaEnv sym)
 formulaEnv proxy sym = do
   undefinedBit <- CRU.freshConstant sym (U.makeSymbol "undefined_bit") knownRepr
   ufs <- Map.fromList <$> mapM toUF (A.uninterpretedFunctions proxy)
@@ -86,7 +86,7 @@ loadFormulas sym lib contents = do
   let env = FE.addLibrary initEnv lib
   F.foldlM (parseFormulaBS env) MapF.empty contents
   where
-    parseFormulaBS :: FE.FormulaEnv sym arch
+    parseFormulaBS :: FE.FormulaEnv sym
                    -> MapF.MapF a (F.ParameterizedFormula sym arch)
                    -> (Some a, BS.ByteString)
                    -> IO (MapF.MapF a (F.ParameterizedFormula sym arch))
@@ -132,7 +132,7 @@ loadFormulasFromFiles sym lib toFP shapes = do
   let env = FE.addLibrary initEnv lib
   F.foldlM (\m (Some (op :: a sh)) -> addIfJust (readFormulaForOpcode env) m op) MapF.empty shapes
   where
-    readFormulaForOpcode :: FE.FormulaEnv sym arch
+    readFormulaForOpcode :: FE.FormulaEnv sym
                          -> a sh
                          -> IO (Maybe (F.ParameterizedFormula sym arch sh))
     readFormulaForOpcode env a = do
@@ -182,7 +182,7 @@ loadLibrary proxy sym contents = do
   env <- formulaEnv proxy sym
   MapF.fromList <$> mapM (parseFunctionBS env) contents
   where
-    parseFunctionBS :: FE.FormulaEnv sym arch
+    parseFunctionBS :: FE.FormulaEnv sym
                     -> (String, BS.ByteString)
                     -> IO (Pair.Pair F.FunctionRef (F.FunctionFormula sym))
     parseFunctionBS env (name, bs) = do
@@ -212,7 +212,7 @@ loadLibraryFromFiles proxy sym dir = do
   -- predictability's sake, we load everything in the initial environment.
   MapF.fromList <$> mapM (loadFile env) files
   where
-    loadFile :: FE.FormulaEnv sym arch
+    loadFile :: FE.FormulaEnv sym
              -> FilePath
              -> IO (Pair.Pair F.FunctionRef (F.FunctionFormula sym))
     loadFile env origFile = do

@@ -24,12 +24,12 @@ import SemMC.Formula.Formula
 -- | Like 'Data.Parameterized.Some.Some', but for doubly-parameterized types.
 data SomeSome (f :: k1 -> k2 -> Type) = forall x y. SomeSome (f x y)
 
-type Functions sym arch = Map.Map String (SomeSome (S.SymFn sym), Some BaseTypeRepr)
+type Functions sym = Map.Map String (SomeSome (S.SymFn sym), Some BaseTypeRepr)
 
 -- | The environment in which formulas are parsed and interpreted. It contains
 -- global information that must be shared across multiple formulas.
-data FormulaEnv sym arch =
-  FormulaEnv { envFunctions :: Functions sym arch
+data FormulaEnv sym =
+  FormulaEnv { envFunctions :: Functions sym
                -- ^ A mapping of all functions (either uninterpreted or defined)
                -- to be used in the formulas. This is necessary so that
                -- different formulas still refer to the same underlying
@@ -42,11 +42,11 @@ data FormulaEnv sym arch =
                -- to be equal.
              }
 
-addLibrary :: FormulaEnv sym arch -> Library sym -> FormulaEnv sym arch
+addLibrary :: FormulaEnv sym -> Library sym -> FormulaEnv sym
 addLibrary env funs =
   env { envFunctions = MapF.foldrWithKey addFun (envFunctions env) funs }
   where
     addFun :: FunctionRef sig -> FunctionFormula sym sig
-           -> Functions sym arch -> Functions sym arch
+           -> Functions sym -> Functions sym
     addFun (FunctionRef name _ _) ff m =
       Map.insert ("df." ++ name) (SomeSome (ffDef ff), Some (ffRetType ff)) m
