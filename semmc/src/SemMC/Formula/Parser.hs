@@ -302,20 +302,23 @@ readInputs _ i = E.throwError $ "malformed input list: " <> show i
 
 -- | "Global" data stored in the Reader monad throughout parsing the definitions.
 
-data DefsInfo sym tps =
+data DefsInfo sym =
   DefsInfo
   { getSym :: sym
     -- ^ SymInterface/ExprBuilder used to build up symbolic
     -- expressions while parsing the definitions.
   , getEnv :: FormulaEnv sym
     -- ^ Global formula environment
-  , getQuotedLookup :: String -> Maybe (Some (S.SymExpr sym))
-  , getOpVarList :: SL.List (S.BoundVar sym) tps
-    -- ^ ShapedList used to retrieve the variable
-    -- corresponding to a given literal.
-  , getOpNameList :: SL.List OpData tps
-    -- ^ ShapedList used to look up the index given an
-    -- operand's name.
+  , getLookupQuotedName :: forall m . 
+      (Monad m,
+       E.MonadError String m) =>
+      String -> m (Some (S.SymExpr sym))
+    -- ^ Function used to lookup SymExprs for quoted names.
+  , getLookupIdentName :: forall m . 
+      (Monad m,
+       E.MonadError String m) =>
+      String -> m (Some (S.SymExpr sym))
+    -- ^ Function used to lookup SymExprs for ident names.
   , getBindings :: Map.Map String (Some (S.SymExpr sym))
     -- ^ Mapping of currently in-scope let-bound variables
     --- to their parsed bindings.
@@ -518,7 +521,7 @@ lookupOp = \case
 readOneArg ::
   (S.IsSymExprBuilder sym,
     E.MonadError String m,
-    MR.MonadReader (DefsInfo sym sh) m,
+    MR.MonadReader (DefsInfo sym) m,
     MonadIO m)
   => SC.SExpr FAtom
   -> m (Some (S.SymExpr sym))
@@ -533,7 +536,7 @@ readOneArg operands = do
 readTwoArgs ::
   (S.IsSymExprBuilder sym,
     E.MonadError String m,
-    MR.MonadReader (DefsInfo sym sh) m,
+    MR.MonadReader (DefsInfo sym) m,
     MonadIO m)
   => SC.SExpr FAtom
   -> m (Some (S.SymExpr sym), Some (S.SymExpr sym))
@@ -548,7 +551,7 @@ readTwoArgs operands = do
 readThreeArgs ::
   (S.IsSymExprBuilder sym,
     E.MonadError String m,
-    MR.MonadReader (DefsInfo sym sh) m,
+    MR.MonadReader (DefsInfo sym) m,
     MonadIO m)
   => SC.SExpr FAtom
   -> m (Some (S.SymExpr sym), Some (S.SymExpr sym), Some (S.SymExpr sym))
@@ -561,10 +564,10 @@ readThreeArgs operands = do
 
 -- | Reads an "application" form, i.e. @(operator operands ...)@.
 readApp ::
-  forall sym m sh .
+  forall sym m .
   (S.IsSymExprBuilder sym,
     E.MonadError String m,
-    MR.MonadReader (DefsInfo sym sh) m,
+    MR.MonadReader (DefsInfo sym) m,
     MonadIO m)
   => SC.SExpr FAtom
   -> SC.SExpr FAtom
@@ -888,11 +891,11 @@ exprAssignment tpAssn exs = exprAssignment' tpAssn (reverse exs) 0 (Ctx.sizeInt 
 -- let, parse the bindings into the Reader monad's state and
 -- then parse the body with those newly bound variables.
 readLetExpr ::
-  forall sym m sh
+  forall sym m
   . (S.IsSymExprBuilder sym,
       Monad m,
       E.MonadError String m,
-      MR.MonadReader (DefsInfo sym sh) m,
+      MR.MonadReader (DefsInfo sym) m,
       MonadIO m)
   => SC.SExpr FAtom
   -- ^ Bindings in a let-expression.
@@ -909,11 +912,11 @@ readLetExpr bindings _body = E.throwError $
 
 
 -- | Parse an arbitrary expression.
-readExpr :: forall sym m sh
+readExpr :: forall sym m
           . (S.IsSymExprBuilder sym,
              Monad m,
              E.MonadError String m,
-             MR.MonadReader (DefsInfo sym sh) m,
+             MR.MonadReader (DefsInfo sym) m,
              MonadIO m)
          => SC.SExpr FAtom
          -> m (Some (S.SymExpr sym))
@@ -954,8 +957,12 @@ readExpr (SC.SAtom (AIdent name)) = do
   case maybeBinding of
     -- if this is actually a let-bound variable, simply return it's binding
     Just binding -> return binding
-    Nothing -> globalLookupIdent name
-readExpr (SC.SAtom (AQuoted qname)) = globalLookupQuoted qname
+    Nothing -> do
+      dinfo <- MR.ask
+      (getLookupIdentName dinfo) name
+readExpr (SC.SAtom (AQuoted qname)) = do
+  dinfo <- MR.ask
+  (getLookupQuotedName dinfo) qname
 readExpr (SC.SCons (SC.SAtom (AIdent "let")) rhs) =
   case rhs of
     (SC.SCons bindings (SC.SCons body SC.SNil)) -> readLetExpr bindings body
@@ -964,38 +971,18 @@ readExpr (SC.SAtom a@(ANamed _ _ _)) = E.throwError $ "unknown named atom: " ++ 
 readExpr (SC.SCons operator operands) = readApp operator operands
 
 
-globalLookupQuoted ::
-  forall sym sh m .
-  (S.IsSymExprBuilder sym,
-   Monad m,
-   E.MonadError String m,
-   MR.MonadReader (DefsInfo sym sh) m,
-   MonadIO m)
-  => String
-  -> m (Some (S.SymExpr sym))
-globalLookupQuoted qname = do
-  dinfo <- MR.ask
-  case userSymbol (literalVarPrefix ++ qname) of
-    Right _ ->
-      case (getQuotedLookup dinfo) qname of
-        Just e -> return e
-        Nothing -> E.throwError $ "unknown quoted value in s-expression: " ++ qname
-    Left _ -> E.throwError $ printf "%s is not a quoted name" qname
 
-globalLookupIdent ::
-  forall sym sh m .
+lookupIdentName ::
+  forall sym m tps .
   (S.IsSymExprBuilder sym,
    Monad m,
-   E.MonadError String m,
-   MR.MonadReader (DefsInfo sym sh) m,
-   MonadIO m)
-  => String
+   E.MonadError String m)
+  => sym
+  -> SL.List (S.BoundVar sym) tps
+  -> SL.List OpData tps
+  -> String
   -> m (Some (S.SymExpr sym))
-globalLookupIdent name = do
-  DefsInfo { getOpNameList = opNames
-           , getSym = sym
-           , getOpVarList = opVars
-           } <- MR.ask
+lookupIdentName sym opVars opNames name = do
   case userSymbol (operandVarPrefix ++ name) of
     Right _ ->
       case (findOpListIndex name opNames) of
@@ -1009,7 +996,7 @@ globalLookupIdent name = do
 readExprs :: (S.IsSymExprBuilder sym,
               Monad m,
               E.MonadError String m,
-              MR.MonadReader (DefsInfo sym sh) m,
+              MR.MonadReader (DefsInfo sym) m,
               MonadIO m)
           => SC.SExpr FAtom
           -> m [Some (S.SymExpr sym)]
@@ -1021,11 +1008,11 @@ readExprs (SC.SCons e rest) = do
   return $ e' : rest'
 
 readExprsAsAssignment ::
-  forall sym m sh .
+  forall sym m .
   (S.IsSymExprBuilder sym,
     Monad m,
     E.MonadError String m,
-    MR.MonadReader (DefsInfo sym sh) m,
+    MR.MonadReader (DefsInfo sym) m,
     MonadIO m)
   => SC.SExpr FAtom
   -> m (Some (Ctx.Assignment (S.SymExpr sym)))
@@ -1047,24 +1034,27 @@ readDefs :: forall arch sym m sh
              Monad m,
              E.MonadError String m,
              A.Architecture arch,
-             MR.MonadReader (DefsInfo sym (OperandTypes arch sh)) m,
+             MR.MonadReader (DefsInfo sym) m,
              MonadIO m,
              ShowF (S.SymExpr sym))
          => A.ShapeRepr arch sh
+         -> SL.List OpData (OperandTypes arch sh)
          -> SC.SExpr FAtom
          -> m (MapF.MapF (Parameter arch sh) (S.SymExpr sym))
-readDefs _ SC.SNil = return MapF.empty
-readDefs shapeRepr (SC.SCons (SC.SCons (SC.SAtom p) (SC.SCons defRaw SC.SNil)) rest) = do
-  oplist <- MR.reader getOpNameList
+readDefs _ _ SC.SNil = return MapF.empty
+readDefs shapeRepr oplist (SC.SCons (SC.SCons (SC.SAtom p) (SC.SCons defRaw SC.SNil)) rest) = do
   Some param <- mapSome (toParameter @arch shapeRepr) <$> readParameter oplist p
   Some def <- readExpr defRaw
   Refl <- fromMaybeError ("mismatching types of parameter and expression for " ++ showF param) $
             testEquality (paramType param) (S.exprType def)
-  rest' <- prefixError (", defining " <> showF def <> " ... ") $ readDefs shapeRepr rest
+  rest' <- prefixError (", defining " <> showF def <> " ... ") $ readDefs shapeRepr oplist rest
   return $ MapF.insert param def rest'
-readDefs shapeRepr (SC.SCons (SC.SCons (SC.SCons mUF (SC.SCons (SC.SAtom p) SC.SNil)) (SC.SCons defRaw SC.SNil)) rest)
+readDefs shapeRepr oplist (SC.SCons
+                           (SC.SCons
+                            (SC.SCons mUF (SC.SCons (SC.SAtom p) SC.SNil))
+                            (SC.SCons defRaw SC.SNil))
+                           rest)
   | Just funcName <- matchUF mUF = prefixError (", processing uninterpreted function " <> show funcName <> " ... ") $ do
-    oplist <- MR.reader getOpNameList
     Some param <- mapSome (toParameter @arch shapeRepr) <$> readParameter oplist p
     fns <- MR.reader (envFunctions . getEnv)
     case Map.lookup funcName fns of
@@ -1072,14 +1062,14 @@ readDefs shapeRepr (SC.SCons (SC.SCons (SC.SCons mUF (SC.SCons (SC.SAtom p) SC.S
         Some def <- readExpr defRaw
         Refl <- fromMaybeError ("mismatching types of parameter and expression for " ++ showF param) $
                   testEquality rep (S.exprType def)
-        rest' <- readDefs @arch shapeRepr rest
+        rest' <- readDefs @arch shapeRepr oplist rest
         case param of
           LiteralParameter {} -> E.throwError "Literals are not allowed as arguments to parameter functions"
           FunctionParameter {} -> E.throwError "Nested parameter functions are not allowed"
           OperandParameter orep oix ->
             return $ MapF.insert (FunctionParameter funcName (WrappedOperand orep oix) rep) def rest'
       _ -> E.throwError ("Missing type repr for uninterpreted function " ++ show funcName)
-readDefs _ _ = E.throwError "invalid defs structure"
+readDefs _ _ _ = E.throwError "invalid defs structure"
 
 matchUF :: SC.SExpr FAtom -> Maybe String
 matchUF se =
@@ -1161,17 +1151,24 @@ readFormula' sym env repr text = do
 
   litVars :: MapF.MapF (A.Location arch) (S.BoundVar sym)
     <- foldrM buildLitVarMap MapF.empty inputs
-    
-  defs <- MR.runReaderT (readDefs repr defsRaw) $
+
+  defs <- MR.runReaderT (readDefs repr operands defsRaw) $
             (DefsInfo { getSym = sym
                       , getEnv = env
-                      , getOpVarList = opVarList
-                      , getOpNameList = operands
                       , getBindings = Map.empty
-                      , getQuotedLookup = \qname -> do
-                          (Some l) <- A.readLocation qname
-                          v <- flip MapF.lookup litVars l
-                          return $ Some $ S.varExpr sym v
+                      , getLookupQuotedName = \qname ->
+                          case userSymbol (literalVarPrefix ++ qname) of
+                            Right _ ->
+                              case A.readLocation qname of
+                                Just (Some l) ->
+                                  case flip MapF.lookup litVars l of
+                                    Just v -> return $ Some $ S.varExpr sym v
+                                    Nothing -> E.throwError $
+                                      "unknown literal name: " ++ qname
+                                Nothing -> E.throwError $
+                                      "unknown location name: " ++ qname
+                            Left _ -> E.throwError $ printf "%s is not a quoted name" qname
+                      , getLookupIdentName = (lookupIdentName sym opVarList operands)
                       })
 
   let finalInputs :: [Some (Parameter arch sh)]
@@ -1271,10 +1268,10 @@ readDefinedFunction' sym env text = do
   Some body <- MR.runReaderT (readExpr bodyRaw) $
     DefsInfo { getSym = sym
              , getEnv = env
-             , getOpVarList = argVarList
-             , getOpNameList = arguments
              , getBindings = Map.empty
-             , getQuotedLookup = const Nothing
+             , getLookupQuotedName = \qname -> do
+                 E.throwError $ "unrecognized quoted name: " ++ qname
+             , getLookupIdentName = (lookupIdentName sym argVarList arguments)
              }
 
   let actualTypeRepr = S.exprType body
